@@ -84,7 +84,7 @@ def run(
 
         gauntlet run --agent-image my-agent:latest --policy policy.yaml
 
-    Requires: pip install -e ".[integration]"
+    Requires: pip install -e ".\[integration]"
     """
     typer.echo("gauntlet run")
     typer.echo(f"  agent-image : {agent_image}")
@@ -95,5 +95,5 @@ def run(
     typer.echo(
         "NOTE: gauntlet run is a stub at D1 scaffold stage.\n"
         "      D2 implements the RAMPART + OpenShell seam.\n"
-        "      Install pip install -e '.[integration]' once D2 is complete."
+        "      Run pip install -e '.[integration]' once D2 is complete."
     )
