@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gauntlet"
+version = "0.1.0"
+description = "The seam artifact: RAMPART assurance executed against an agent running inside OpenShell isolation — one command"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Murali Raju", email = "murali.raju@appliv.com" }]
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+]
+integration = [
+    # Install when running against real RAMPART + OpenShell:
+    #   pip install -e ".[integration]"
+    # Both projects are alpha-stage; these are declared here for lineage and
+    # future wiring — NOT required for core CLI use or unit tests.
+    "rampart>=0.1.0",      # https://github.com/microsoft/RAMPART  (MIT)
+    "openshell>=0.0.46",   # https://github.com/NVIDIA/OpenShell   (Apache-2.0)
+]
+
+[project.scripts]
+gauntlet = "gauntlet.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: requires RAMPART and OpenShell installed; skips when absent",
+]
