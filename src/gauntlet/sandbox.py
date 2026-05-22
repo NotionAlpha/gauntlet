@@ -14,6 +14,8 @@ Security contract:
   - The isolation boundary is DENY-BY-DEFAULT.  SandboxPolicy with no allowlists
     means the agent has no permitted network egress and no permitted filesystem access
     beyond what OpenShell grants by default (none).
+  - SandboxPolicy lists are immutable after construction — widening the boundary
+    requires constructing a new policy, making accidental mutation visible.
   - The agent image is treated as UNTRUSTED.  No credentials, API keys, or host
     filesystem paths are passed INTO the sandbox.
   - SandboxError messages are sanitized before being raised — they must not expose
@@ -24,28 +26,12 @@ Threat model note: see README.md → Threat model.
 
 from __future__ import annotations
 
-import re
 import uuid
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Generator, Optional
 
-
-# ---------------------------------------------------------------------------
-# Path/credential sanitizer for error messages
-# ---------------------------------------------------------------------------
-
-def _sanitize_message(raw: str) -> str:
-    """Strip host paths and credential-like strings from error messages.
-
-    Applied to all SandboxError messages before they leave this module.
-    """
-    text = re.sub(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", "[REDACTED_BEARER]", raw, flags=re.IGNORECASE)
-    text = re.sub(r"sk-[A-Za-z0-9]{20,}", "[REDACTED_SK_KEY]", text)
-    text = re.sub(r"(?:ghp|ghs|ghr|npm)_[A-Za-z0-9]{10,}", "[REDACTED_TOKEN]", text)
-    text = re.sub(r"(?:/[\w.\-]+){4,}", "[REDACTED_PATH]", text)
-    text = re.sub(r"[A-Za-z0-9+/=]{40,}", "[REDACTED_TOKEN]", text)
-    return text
+from gauntlet._sanitizer import sanitize as _sanitize
 
 
 # ---------------------------------------------------------------------------
@@ -66,11 +52,15 @@ class SandboxError(Exception):
 class SandboxPolicy:
     """Declarative deny-by-default sandbox policy.
 
-    Maps directly to OpenShell's YAML policy structure.  Empty lists mean DENY
-    for that domain — no allowlisted network destinations, no readable filesystem
-    paths, no writable filesystem paths.
+    Maps directly to OpenShell's YAML policy structure.  Empty sequences mean
+    DENY for that domain — no allowlisted network destinations, no readable
+    filesystem paths, no writable filesystem paths.
 
     This is the default posture and should not be relaxed without explicit reason.
+
+    Policy allowlists are stored as tuples and are immutable after construction.
+    To widen the boundary, construct a new SandboxPolicy — mutation at the call
+    site is not possible, which makes boundary widening intentional and visible.
 
     Args:
         network_allow: Allowlisted outbound network destinations (e.g. "https://api.example.com").
@@ -86,23 +76,23 @@ class SandboxPolicy:
         fs_read_only: Optional[list[str]] = None,
         fs_read_write: Optional[list[str]] = None,
     ) -> None:
-        self.network_allow: list[str] = network_allow or []
-        self.fs_read_only: list[str] = fs_read_only or []
-        self.fs_read_write: list[str] = fs_read_write or []
+        self.network_allow: tuple[str, ...] = tuple(network_allow or [])
+        self.fs_read_only: tuple[str, ...] = tuple(fs_read_only or [])
+        self.fs_read_write: tuple[str, ...] = tuple(fs_read_write or [])
 
     def to_dict(self) -> dict:
         return {
-            "network_allow": self.network_allow,
-            "fs_read_only": self.fs_read_only,
-            "fs_read_write": self.fs_read_write,
+            "network_allow": list(self.network_allow),
+            "fs_read_only": list(self.fs_read_only),
+            "fs_read_write": list(self.fs_read_write),
         }
 
     def __repr__(self) -> str:
         return (
             f"SandboxPolicy("
-            f"network_allow={self.network_allow!r}, "
-            f"fs_read_only={self.fs_read_only!r}, "
-            f"fs_read_write={self.fs_read_write!r})"
+            f"network_allow={list(self.network_allow)!r}, "
+            f"fs_read_only={list(self.fs_read_only)!r}, "
+            f"fs_read_write={list(self.fs_read_write)!r})"
         )
 
 
@@ -227,9 +217,7 @@ class FakeSandbox(SandboxAdapter):
         policy: SandboxPolicy,
     ) -> Generator[SandboxContext, None, None]:
         if self._fail:
-            msg = _sanitize_message(
-                f"SandboxError (fake): {self._fail_reason}"
-            )
+            msg = _sanitize(f"SandboxError (fake): {self._fail_reason}")
             raise SandboxError(msg)
         self.last_agent_image = agent_image
         ctx = SandboxContext(
@@ -312,7 +300,5 @@ class OpenShellSandbox(SandboxAdapter):
         except SandboxError:
             raise
         except Exception as exc:
-            msg = _sanitize_message(
-                f"OpenShell sandbox error: {type(exc).__name__}: {exc}"
-            )
+            msg = _sanitize(f"OpenShell sandbox error: {type(exc).__name__}: {exc}")
             raise SandboxError(msg) from exc

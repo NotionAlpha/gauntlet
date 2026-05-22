@@ -24,28 +24,10 @@ Threat model note: see README.md → Threat model.
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime, timezone
 
+from gauntlet._sanitizer import sanitize as _sanitize
 from gauntlet.seam import SeamResult
-
-
-# ---------------------------------------------------------------------------
-# Output sanitizer (defence-in-depth)
-# ---------------------------------------------------------------------------
-
-def _sanitize_output(raw: str) -> str:
-    """Strip credential-like strings from report output (defence-in-depth).
-
-    Evidence is already sanitized at the AssuranceFinding level.  This
-    sanitizer is an additional layer applied to the entire rendered output.
-    """
-    text = re.sub(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", "[REDACTED_BEARER]", raw, flags=re.IGNORECASE)
-    text = re.sub(r"sk-[A-Za-z0-9]{20,}", "[REDACTED_SK_KEY]", text)
-    text = re.sub(r"(?:ghp|ghs|ghr|npm)_[A-Za-z0-9]{10,}", "[REDACTED_TOKEN]", text)
-    text = re.sub(r"(?:/[\w.\-]+){4,}", "[REDACTED_PATH]", text)
-    text = re.sub(r"[A-Za-z0-9+/=]{40,}", "[REDACTED_TOKEN]", text)
-    return text
 
 
 # ---------------------------------------------------------------------------
@@ -199,4 +181,4 @@ def render_report(result: SeamResult, fmt: str = "text") -> str:
             f"Unsupported report format: {fmt!r}.  "
             f"Supported formats: 'text', 'json'."
         )
-    return _sanitize_output(raw)
+    return _sanitize(raw)

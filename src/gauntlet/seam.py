@@ -49,9 +49,9 @@ Threat model note: see README.md → Threat model.
 
 from __future__ import annotations
 
-import re
 from typing import Optional
 
+from gauntlet._sanitizer import sanitize as _sanitize
 from gauntlet.assurance import AssuranceAdapter, AssuranceError, AssuranceResult
 from gauntlet.sandbox import SandboxAdapter, SandboxContext, SandboxError, SandboxPolicy
 
@@ -119,16 +119,6 @@ class SeamResult:
 # Seam orchestration
 # ---------------------------------------------------------------------------
 
-def _sanitize_seam_error(raw: str) -> str:
-    """Strip host paths and credentials from SeamError messages."""
-    text = re.sub(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", "[REDACTED_BEARER]", raw, flags=re.IGNORECASE)
-    text = re.sub(r"sk-[A-Za-z0-9]{20,}", "[REDACTED_SK_KEY]", text)
-    text = re.sub(r"(?:ghp|ghs|ghr|npm)_[A-Za-z0-9]{10,}", "[REDACTED_TOKEN]", text)
-    text = re.sub(r"(?:/[\w.\-]+){4,}", "[REDACTED_PATH]", text)
-    text = re.sub(r"[A-Za-z0-9+/=]{40,}", "[REDACTED_TOKEN]", text)
-    return text
-
-
 def run_seam(
     agent_image: str,
     sandbox: SandboxAdapter,
@@ -189,7 +179,7 @@ def run_seam(
                     agent_endpoint=ctx.agent_endpoint,
                 )
             except AssuranceError as exc:
-                msg = _sanitize_seam_error(
+                msg = _sanitize(
                     f"Assurance failed: {exc}"
                 )
                 raise SeamError(msg) from exc
@@ -205,12 +195,12 @@ def run_seam(
     except SeamError:
         raise
     except SandboxError as exc:
-        msg = _sanitize_seam_error(
+        msg = _sanitize(
             f"Sandbox failed: {exc}"
         )
         raise SeamError(msg) from exc
     except Exception as exc:
-        msg = _sanitize_seam_error(
+        msg = _sanitize(
             f"Seam error: {type(exc).__name__}: {exc}"
         )
         raise SeamError(msg) from exc

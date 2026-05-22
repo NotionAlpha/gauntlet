@@ -30,9 +30,9 @@ class TestSandboxPolicy:
     def test_default_policy_is_deny_by_default(self):
         """A SandboxPolicy with no arguments has no allowlisted items — deny-by-default."""
         policy = SandboxPolicy()
-        assert policy.network_allow == []
-        assert policy.fs_read_only == []
-        assert policy.fs_read_write == []
+        assert len(policy.network_allow) == 0
+        assert len(policy.fs_read_only) == 0
+        assert len(policy.fs_read_write) == 0
 
     def test_policy_accepts_custom_allowlists(self):
         policy = SandboxPolicy(
@@ -80,7 +80,7 @@ class TestSandboxContext:
             policy=policy,
             isolated=True,
         )
-        assert ctx.policy.network_allow == ["https://api.example.com"]
+        assert "https://api.example.com" in ctx.policy.network_allow
 
     def test_context_to_dict_no_host_paths(self):
         """Context dict must not expose raw host filesystem paths as plain strings."""
@@ -121,7 +121,7 @@ class TestFakeSandbox:
         policy = SandboxPolicy(network_allow=["https://api.example.com"])
         sandbox = FakeSandbox()
         with sandbox.start(agent_image="my-agent:latest", policy=policy) as ctx:
-            assert ctx.policy.network_allow == ["https://api.example.com"]
+            assert "https://api.example.com" in ctx.policy.network_allow
 
     def test_fake_sandbox_records_agent_image(self):
         sandbox = FakeSandbox()
@@ -156,6 +156,13 @@ class TestFakeSandbox:
         policy = SandboxPolicy()
         sandbox = FakeSandbox()
         with sandbox.start(agent_image="my-agent:latest", policy=policy) as ctx:
-            assert ctx.policy.network_allow == []
-            assert ctx.policy.fs_read_only == []
-            assert ctx.policy.fs_read_write == []
+            assert len(ctx.policy.network_allow) == 0
+            assert len(ctx.policy.fs_read_only) == 0
+            assert len(ctx.policy.fs_read_write) == 0
+
+    def test_policy_allowlists_are_immutable(self):
+        """SandboxPolicy allowlists must be immutable — widening the boundary
+        after construction must be impossible, preventing silent policy mutation."""
+        policy = SandboxPolicy(network_allow=["https://api.example.com"])
+        with pytest.raises((AttributeError, TypeError)):
+            policy.network_allow.append("https://evil.example.com")  # type: ignore[union-attr]

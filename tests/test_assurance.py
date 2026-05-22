@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import pytest
 
+from gauntlet._sanitizer import sanitize as _sanitize_finding
 from gauntlet.assurance import (
     AssuranceAdapter,
     AssuranceError,
     AssuranceFinding,
     AssuranceResult,
     FakeAssurance,
-    _sanitize_finding,
 )
 
 
@@ -58,6 +58,14 @@ class TestSanitizeFinding:
         result = _sanitize_finding(raw)
         assert "Agent refused" in result
         assert "policy denied" in result
+
+    def test_oversized_input_is_truncated(self):
+        """Sanitizer must truncate inputs larger than _MAX_INPUT_LENGTH (16 KiB)
+        to prevent unbounded memory allocation from untrusted target output."""
+        from gauntlet._sanitizer import _MAX_INPUT_LENGTH
+        oversized = "x" * (_MAX_INPUT_LENGTH + 1024)
+        result = _sanitize_finding(oversized)
+        assert len(result) <= _MAX_INPUT_LENGTH
 
 
 class TestAssuranceFinding:

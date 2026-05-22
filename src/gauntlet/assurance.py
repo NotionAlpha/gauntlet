@@ -14,8 +14,9 @@ Security contract:
   - The adapter takes an agent_endpoint (HTTP address of the sandboxed agent).
     It does NOT accept credentials, API keys, or host paths.
   - Evidence strings from findings are sanitized before inclusion in AssuranceResult.
-    The sanitizer (``_sanitize_finding``) strips Bearer tokens, sk- keys, GitHub/npm
-    tokens, absolute filesystem paths, and long opaque tokens.
+    The canonical sanitizer (gauntlet._sanitizer.sanitize) strips Bearer tokens,
+    sk- keys, GitHub/npm tokens, absolute filesystem paths, and long opaque tokens.
+    It also truncates evidence to 16 KiB to bound memory use on untrusted input.
   - The adapter must not inject credentials into the agent session.
 
 Threat model note: see README.md → Threat model.
@@ -23,34 +24,11 @@ Threat model note: see README.md → Threat model.
 
 from __future__ import annotations
 
-import re
 import uuid
 from abc import ABC, abstractmethod
 from typing import Optional
 
-
-# ---------------------------------------------------------------------------
-# Credential/path sanitizer for finding evidence
-# ---------------------------------------------------------------------------
-
-def _sanitize_finding(raw: str) -> str:
-    """Strip credential-like strings from finding evidence before output.
-
-    Mirrors the discipline from benchmarks/assurance/src/assurance_benchmark/evaluator.py.
-    Applied to every AssuranceFinding.evidence at construction time.
-
-    Patterns:
-      - Bearer tokens
-      - Prefixed secret tokens: OpenAI sk-, GitHub ghp_/ghs_/ghr_, npm npm_
-      - Absolute filesystem paths (Unix — 3+ components)
-      - Long unbroken alphanumeric runs >= 40 chars (catches raw base64/hex tokens)
-    """
-    text = re.sub(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", "[REDACTED_BEARER]", raw, flags=re.IGNORECASE)
-    text = re.sub(r"sk-[A-Za-z0-9]{20,}", "[REDACTED_SK_KEY]", text)
-    text = re.sub(r"(?:ghp|ghs|ghr|npm)_[A-Za-z0-9]{10,}", "[REDACTED_TOKEN]", text)
-    text = re.sub(r"(?:/[\w.\-]+){3,}", "[REDACTED_PATH]", text)
-    text = re.sub(r"[A-Za-z0-9+/=]{40,}", "[REDACTED_TOKEN]", text)
-    return text
+from gauntlet._sanitizer import sanitize as _sanitize
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +66,7 @@ class AssuranceFinding:
         self.test_id = test_id
         self.name = name
         self.passed = passed
-        self.evidence = _sanitize_finding(evidence)
+        self.evidence = _sanitize(evidence)
 
     def to_dict(self) -> dict:
         return {
@@ -332,6 +310,9 @@ class RampartAssurance(AssuranceAdapter):
 
             findings: list[AssuranceFinding] = []
             for test in raw_result.tests:
+                # str(test.evidence) may contain data produced by the untrusted
+                # target agent.  AssuranceFinding sanitizes via _sanitize(), which
+                # also truncates to _MAX_INPUT_LENGTH before applying regexes.
                 findings.append(
                     AssuranceFinding(
                         test_id=test.id,
@@ -355,6 +336,7 @@ class RampartAssurance(AssuranceAdapter):
         except AssuranceError:
             raise
         except Exception as exc:
-            raise AssuranceError(
-                f"RAMPART runner error: {type(exc).__name__}: {exc}"
-            ) from exc
+            # Sanitize the exception message before raising — it may contain
+            # data from the target agent that RAMPART surfaced in a runner crash.
+            msg = _sanitize(f"RAMPART runner error: {type(exc).__name__}: {exc}")
+            raise AssuranceError(msg) from exc
