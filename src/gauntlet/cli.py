@@ -7,14 +7,19 @@ OpenShell isolation — one command.
 Commands
 --------
 gauntlet run    Run RAMPART assurance against an agent in an OpenShell sandbox.
-                (Stub at D1 scaffold stage — D2 implements the seam.)
 """
 
 from __future__ import annotations
 
+import sys
+
 import typer
 
 from gauntlet import __version__
+from gauntlet.assurance import FakeAssurance
+from gauntlet.report import render_report
+from gauntlet.sandbox import FakeSandbox, SandboxPolicy
+from gauntlet.seam import SeamError, run_seam
 
 app = typer.Typer(
     name="gauntlet",
@@ -69,31 +74,92 @@ def run(
         "--dry-run",
         help="Validate inputs and print the run plan without executing.",
     ),
+    output_format: str = typer.Option(
+        "text",
+        "--output",
+        "-o",
+        help="Report format: 'text' (human-readable, default) or 'json' (machine-readable).",
+    ),
+    use_fakes: bool = typer.Option(  # noqa: FBT001
+        False,
+        "--use-fakes",
+        help=(
+            "Use fake sandbox and assurance adapters (for development/testing). "
+            "Runs without real RAMPART or OpenShell installed."
+        ),
+        hidden=False,
+    ),
 ) -> None:
     """Run RAMPART assurance against an agent inside an OpenShell sandbox.
 
-    This command is the Gauntlet seam: it starts an OpenShell sandbox around
-    the specified agent image, then drives RAMPART's assurance tests against
-    the agent executing inside that sandbox.
+    This command is the Gauntlet seam: it starts an OpenShell deny-by-default
+    isolation boundary around the specified agent image, then drives RAMPART
+    assurance tests against the agent executing inside that boundary, and emits
+    a structured report.
 
-    STUB: This command is scaffolded at D1. D2 (seam implementation) wires
-    the actual RAMPART + OpenShell integration. Running it now will print the
-    planned invocation and exit without executing anything.
+    The agent image is treated as UNTRUSTED. The sandbox enforces a deny-by-default
+    policy — no network egress and no filesystem access are permitted unless
+    explicitly listed in the policy file.
 
-    Example (once D2 is complete):
+    Example (with real RAMPART + OpenShell):
 
+        pip install -e ".[integration]"
         gauntlet run --agent-image my-agent:latest --policy policy.yaml
 
-    Requires: pip install -e ".\[integration]"
+    Example (with fake adapters, no install required):
+
+        gauntlet run --agent-image my-agent:latest --use-fakes
+
+    Example (dry run — print the plan without executing):
+
+        gauntlet run --agent-image my-agent:latest --dry-run
+
+    Report format:
+
+        gauntlet run --agent-image my-agent:latest --use-fakes --output json
     """
-    typer.echo("gauntlet run")
-    typer.echo(f"  agent-image : {agent_image}")
-    typer.echo(f"  policy      : {policy}")
-    typer.echo(f"  suite       : {suite}")
-    typer.echo(f"  dry-run     : {dry_run}")
-    typer.echo("")
-    typer.echo(
-        "NOTE: gauntlet run is a stub at D1 scaffold stage.\n"
-        "      D2 implements the RAMPART + OpenShell seam.\n"
-        "      Run pip install -e '.[integration]' once D2 is complete."
-    )
+    if use_fakes or dry_run:
+        sandbox = FakeSandbox()
+        assurance = FakeAssurance()
+        sandbox_policy = SandboxPolicy()
+    else:
+        # Import real adapters — requires [integration] extra.
+        try:
+            from gauntlet.sandbox import OpenShellSandbox  # type: ignore[attr-defined]
+            from gauntlet.assurance import RampartAssurance  # type: ignore[attr-defined]
+            sandbox = OpenShellSandbox(policy_path=policy)  # type: ignore[assignment]
+            assurance = RampartAssurance()  # type: ignore[assignment]
+            sandbox_policy = SandboxPolicy()
+        except ImportError:
+            typer.echo(
+                "ERROR: RAMPART or OpenShell is not installed.\n"
+                "Install with: pip install -e '.[integration]'\n\n"
+                "To run with fake adapters (no install required), use --use-fakes.\n"
+                "To print the run plan without executing, use --dry-run.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+    try:
+        result = run_seam(
+            agent_image=agent_image,
+            sandbox=sandbox,
+            assurance=assurance,
+            policy=sandbox_policy,
+            suite=suite,
+            dry_run=dry_run,
+        )
+    except SeamError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        report = render_report(result, fmt=output_format)
+    except ValueError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(report)
+
+    if not dry_run and not result.overall_passed:
+        raise typer.Exit(code=1)
