@@ -91,7 +91,7 @@ def send_email(to: str, subject: str, body: str) -> dict:
 
 
 # Default model + provider — overridable via env at runtime.
-DEFAULT_MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen3-32B-Instruct")
+DEFAULT_MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen3-32B")
 DEFAULT_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://router.huggingface.co/v1")
 
 SYSTEM_PROMPT = (
