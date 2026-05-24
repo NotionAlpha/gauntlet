@@ -1,0 +1,37 @@
+name: canonical-agent-image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'agents/canonical/**'
+      - '.github/workflows/canonical-agent-image.yml'
+  pull_request:
+    paths:
+      - 'agents/canonical/**'
+      - '.github/workflows/canonical-agent-image.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build canonical-agent image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: agents/canonical
+          file: agents/canonical/Dockerfile
+          push: false
+          load: true
+          tags: gauntlet/canonical-agent:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-inspect the built image
+        run: |
+          docker image inspect gauntlet/canonical-agent:ci \
+            --format '{{.Config.Cmd}} on port {{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}'
