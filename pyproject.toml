@@ -35,7 +35,8 @@ gauntlet = "gauntlet.cli:app"
 where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "agents"]
+pythonpath = ["."]
 markers = [
     "integration: requires RAMPART and OpenShell installed; skips when absent",
 ]
