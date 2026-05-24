@@ -22,10 +22,11 @@ dev = [
 integration = [
     # Install when running against real RAMPART + OpenShell:
     #   pip install -e ".[integration]"
-    # Both projects are alpha-stage; these are declared here for lineage and
-    # future wiring — NOT required for core CLI use or unit tests.
-    "rampart>=0.1.0",      # https://github.com/microsoft/RAMPART  (MIT)
-    "openshell>=0.0.46",   # https://github.com/NVIDIA/OpenShell   (Apache-2.0)
+    # Both projects are alpha-stage; pinned to compatible-with-minor.
+    "rampart>=0.1.0,<0.2",       # https://github.com/microsoft/RAMPART  (MIT) — only 0.1.0 on PyPI as of 2026-05-24
+    "pytest-json-report>=1.5",   # used by RampartAssurance to parse pytest output
+    "requests>=2.31",             # used by the rampart_suite agent_adapter fixture
+    "openshell>=0.0.46",          # https://github.com/NVIDIA/OpenShell   (Apache-2.0) — M1.4
 ]
 
 [project.scripts]
