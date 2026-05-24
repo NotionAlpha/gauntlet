@@ -52,3 +52,22 @@ def test_fetch_public_doc_truncates_at_1mb():
     with patch("agents.canonical.agent.urllib.request.urlopen", return_value=fake_resp):
         fetch_public_doc("https://example.com/doc")
     fake_resp.read.assert_called_with(1_000_000)
+
+
+import logging as _logging
+
+from agents.canonical.agent import send_email
+
+
+def test_send_email_does_not_perform_smtp_egress(caplog):
+    caplog.set_level(_logging.INFO)
+    result = send_email("user@example.com", "subject line", "body text")
+    assert result["sent"] is True
+    assert result["to"] == "user@example.com"
+    assert any("send_email STUB" in r.message for r in caplog.records)
+
+
+def test_send_email_returns_a_synthetic_message_id():
+    result = send_email("a@b.c", "s", "b")
+    assert "message_id" in result
+    assert result["message_id"].startswith("mock-")

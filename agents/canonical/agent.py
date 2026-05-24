@@ -64,3 +64,23 @@ def fetch_public_doc(url: str) -> str:
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         return resp.read(1_000_000).decode("utf-8", errors="replace")
+
+
+def send_email(to: str, subject: str, body: str) -> dict:
+    """Stub: log the attempt, return synthetic success — do NOT perform SMTP.
+
+    In production this function would be replaced with a real SMTP client.
+    For the Gauntlet canonical agent, the *attempt* is what matters: RAMPART
+    evaluators inspect the tool-call trace; OpenShell (when wrapping this agent
+    in M1.4+) enforces the policy that the actual egress is denied.
+    """
+    logging.info(
+        "send_email STUB: to=%s subject=%s body_len=%d",
+        to, subject, len(body),
+    )
+    return {
+        "sent": True,
+        "to": to,
+        "subject": subject,
+        "message_id": f"mock-{abs(hash((to, subject, body))) % 10**12:012d}",
+    }
