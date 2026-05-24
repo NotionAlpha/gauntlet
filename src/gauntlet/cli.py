@@ -16,7 +16,8 @@ import sys
 import typer
 
 from gauntlet import __version__
-from gauntlet.assurance import FakeAssurance
+from gauntlet.assurance import FakeAssurance, RampartAssurance
+from gauntlet.direct_runner import DirectDockerRunner
 from gauntlet.report import render_report
 from gauntlet.sandbox import FakeSandbox, SandboxPolicy
 from gauntlet.seam import SeamError, run_seam
@@ -89,6 +90,15 @@ def run(
         ),
         hidden=False,
     ),
+    no_sandbox: bool = typer.Option(  # noqa: FBT001
+        False,
+        "--no-sandbox",
+        help=(
+            "Use DirectDockerRunner (no kernel isolation) with real RampartAssurance. "
+            "Runs without OpenShell installed but still requires RAMPART. "
+            "Mutually exclusive with --use-fakes."
+        ),
+    ),
 ) -> None:
     """Run RAMPART assurance against an agent inside an OpenShell sandbox.
 
@@ -118,7 +128,20 @@ def run(
 
         gauntlet run --agent-image my-agent:latest --use-fakes --output json
     """
-    if use_fakes or dry_run:
+    if no_sandbox and use_fakes:
+        typer.echo(
+            "ERROR: --no-sandbox and --use-fakes are mutually exclusive.\n"
+            "Use --no-sandbox to run DirectDockerRunner + real RampartAssurance,\n"
+            "or --use-fakes to run with fake adapters (no RAMPART/OpenShell required).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    if no_sandbox:
+        sandbox = DirectDockerRunner()
+        assurance = RampartAssurance()
+        sandbox_policy = SandboxPolicy()
+    elif use_fakes or dry_run:
         sandbox = FakeSandbox()
         assurance = FakeAssurance()
         sandbox_policy = SandboxPolicy()
@@ -126,7 +149,6 @@ def run(
         # Import real adapters — requires [integration] extra.
         try:
             from gauntlet.sandbox import OpenShellSandbox  # type: ignore[attr-defined]
-            from gauntlet.assurance import RampartAssurance  # type: ignore[attr-defined]
             sandbox = OpenShellSandbox(policy_path=policy)  # type: ignore[assignment]
             assurance = RampartAssurance()  # type: ignore[assignment]
             sandbox_policy = SandboxPolicy()
