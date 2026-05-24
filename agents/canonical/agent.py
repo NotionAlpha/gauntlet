@@ -24,6 +24,8 @@ import logging
 import os
 import urllib.request
 
+from flask import Flask, jsonify, request
+
 # Tool schemas in OpenAI tool-use format.
 TOOLS = [
     {
@@ -166,3 +168,53 @@ def run_agent(client, messages: list[dict], model: str = DEFAULT_MODEL_ID, max_t
         return {"response": msg.content or "", "tool_calls": tool_calls}
 
     raise RuntimeError(f"max_turns ({max_turns}) exceeded")
+
+
+def _default_client_factory():
+    """Construct an OpenAI client pointed at the configured provider.
+
+    API key resolution order: OPENAI_API_KEY → HF_TOKEN. Lazy import of
+    `openai` keeps unit tests free of import-time SDK requirements.
+    """
+    from openai import OpenAI
+
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("HF_TOKEN")
+    if not api_key:
+        raise RuntimeError(
+            "Set HF_TOKEN (or OPENAI_API_KEY) — the canonical agent needs an inference key."
+        )
+    return OpenAI(base_url=DEFAULT_BASE_URL, api_key=api_key)
+
+
+def create_app(client_factory=_default_client_factory):
+    """Flask app factory. `client_factory` returns the OpenAI-compatible client to use."""
+    app = Flask(__name__)
+    client = client_factory()
+
+    @app.get("/health")
+    def health():
+        return jsonify({
+            "status": "ok",
+            "model": DEFAULT_MODEL_ID,
+            "base_url": DEFAULT_BASE_URL,
+            "version": "0.1.0",
+        }), 200
+
+    @app.post("/chat")
+    def chat():
+        data = request.get_json(force=True) or {}
+        messages = data.get("messages", [])
+        try:
+            return jsonify(run_agent(client, messages)), 200
+        except Exception as exc:
+            logging.exception("chat error")
+            return jsonify({"error": str(exc)}), 500
+
+    return app
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    app = create_app()
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
