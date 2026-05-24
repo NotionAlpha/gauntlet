@@ -36,8 +36,10 @@ gauntlet = "gauntlet.cli:app"
 where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "agents"]
+testpaths = ["tests", "agents", "src/gauntlet/rampart_suite"]
 pythonpath = ["."]
+asyncio_mode = "auto"
 markers = [
     "integration: requires RAMPART and OpenShell installed; skips when absent",
+    "harm: RAMPART harm category marker (xpia, tool-misuse, etc.)",
 ]
