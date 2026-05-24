@@ -9,13 +9,16 @@ Verifies:
 - `gauntlet run --agent-image ... --dry-run` exits 0 and prints the plan.
 - `gauntlet run --agent-image ... --use-fakes` exits 0 and prints a real report.
 - `gauntlet run --agent-image ... --use-fakes --output json` produces valid JSON.
+- `gauntlet run --agent-image ... --no-sandbox` selects DirectDockerRunner + RampartAssurance.
+- `gauntlet run --agent-image ... --no-sandbox --use-fakes` exits non-zero (mutually exclusive).
 
-No RAMPART or OpenShell required — all execution tests use --use-fakes or --dry-run.
+No RAMPART or OpenShell required — all execution tests use --use-fakes, --dry-run, or mocks.
 """
 
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock, patch
 
 import pytest
 from typer.testing import CliRunner
@@ -184,3 +187,97 @@ class TestRunCommandWithFakes:
             ["run", "--agent-image", "a:b", "--use-fakes", "--output", "yaml"],
         )
         assert result.exit_code != 0
+
+
+class TestNoSandboxFlag:
+    """Tests for the --no-sandbox flag (DirectDockerRunner + RampartAssurance, no fakes)."""
+
+    def _make_passing_seam_result(self, agent_image: str = "my-agent:latest"):
+        """Return a SeamResult that reports overall pass."""
+        from gauntlet.seam import SeamResult
+        from gauntlet.assurance import AssuranceResult
+        from gauntlet.sandbox import SandboxContext, SandboxPolicy
+        assurance_result = AssuranceResult(
+            suite="default",
+            findings=[],
+            passed=1,
+            failed=0,
+            errors=0,
+        )
+        ctx = SandboxContext(
+            sandbox_id="fake-container-id",
+            agent_endpoint="http://localhost:8080",
+            policy=SandboxPolicy(),
+            isolated=False,
+        )
+        result = SeamResult(
+            agent_image=agent_image,
+            suite="default",
+            dry_run=False,
+            overall_passed=True,
+            sandbox_context=ctx,
+            assurance_result=assurance_result,
+        )
+        return result
+
+    def test_no_sandbox_flag_selects_direct_docker_runner(self):
+        """--no-sandbox must instantiate DirectDockerRunner as the sandbox adapter."""
+        passing_result = self._make_passing_seam_result()
+
+        with (
+            patch("gauntlet.cli.DirectDockerRunner") as mock_ddr_cls,
+            patch("gauntlet.cli.RampartAssurance"),
+            patch("gauntlet.cli.run_seam", return_value=passing_result),
+        ):
+            mock_ddr_cls.return_value = MagicMock()
+            result = runner.invoke(
+                app, ["run", "--agent-image", "my-agent:latest", "--no-sandbox"]
+            )
+
+        assert result.exit_code == 0, result.output
+        mock_ddr_cls.assert_called_once()
+
+    def test_no_sandbox_uses_real_rampart_assurance(self):
+        """--no-sandbox must instantiate RampartAssurance (not FakeAssurance)."""
+        passing_result = self._make_passing_seam_result()
+
+        with (
+            patch("gauntlet.cli.DirectDockerRunner") as mock_ddr_cls,
+            patch("gauntlet.cli.RampartAssurance") as mock_rampart_cls,
+            patch("gauntlet.cli.run_seam", return_value=passing_result),
+        ):
+            mock_ddr_cls.return_value = MagicMock()
+            mock_rampart_cls.return_value = MagicMock()
+            result = runner.invoke(
+                app, ["run", "--agent-image", "my-agent:latest", "--no-sandbox"]
+            )
+
+        assert result.exit_code == 0, result.output
+        mock_rampart_cls.assert_called_once()
+
+    def test_no_sandbox_and_use_fakes_mutually_exclusive(self):
+        """--no-sandbox and --use-fakes together must exit non-zero with a clear error."""
+        result = runner.invoke(
+            app,
+            ["run", "--agent-image", "my-agent:latest", "--no-sandbox", "--use-fakes"],
+        )
+        assert result.exit_code != 0
+        combined = (result.output + (result.stderr if hasattr(result, "stderr") and result.stderr else "")).lower()
+        assert "mutually exclusive" in combined or "cannot" in combined or "incompatible" in combined
+
+    def test_no_sandbox_without_other_flags_works(self):
+        """--no-sandbox alone must exit 0 when run_seam returns a passing SeamResult."""
+        passing_result = self._make_passing_seam_result()
+
+        with (
+            patch("gauntlet.cli.DirectDockerRunner") as mock_ddr_cls,
+            patch("gauntlet.cli.RampartAssurance") as mock_rampart_cls,
+            patch("gauntlet.cli.run_seam", return_value=passing_result),
+        ):
+            mock_ddr_cls.return_value = MagicMock()
+            mock_rampart_cls.return_value = MagicMock()
+            result = runner.invoke(
+                app, ["run", "--agent-image", "my-agent:latest", "--no-sandbox"]
+            )
+
+        assert result.exit_code == 0, result.output
