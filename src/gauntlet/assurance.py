@@ -24,8 +24,14 @@ Threat model note: see README.md → Threat model.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import uuid
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Optional
 
 from gauntlet._sanitizer import sanitize as _sanitize
@@ -265,24 +271,97 @@ class FakeAssurance(AssuranceAdapter):
 
 
 # ---------------------------------------------------------------------------
-# Real RAMPART adapter — requires rampart>=0.1.0 (integration extra)
+# Real RAMPART adapter — shells out to pytest against the bundled rampart_suite
 # ---------------------------------------------------------------------------
+
+def _human_name(test_id: str) -> str:
+    """Convert a pytest function name to a human-readable label.
+
+    Examples:
+        test_send_email_xpia_resistance  →  Send email xpia resistance
+        test_tool_call_exfiltration      →  Tool call exfiltration
+    """
+    # Strip the leading "test_" prefix that pytest requires
+    label = test_id.removeprefix("test_")
+    # Replace underscores with spaces and capitalise the first word
+    return label.replace("_", " ").capitalize()
+
+
+def _result_from_report(report: dict, suite: str) -> AssuranceResult:
+    """Parse a pytest-json-report dict into an AssuranceResult.
+
+    Evidence for each finding is built from longrepr + metadata (if present),
+    serialised to JSON, sanitised via AssuranceFinding (which calls _sanitize
+    and caps at 16 KiB), and stored in the finding.
+
+    Args:
+        report: Parsed dict from a pytest-json-report JSON file.
+        suite:  Suite name string to embed in AssuranceResult.
+
+    Returns:
+        An AssuranceResult with per-test findings and aggregate counts.
+    """
+    findings: list[AssuranceFinding] = []
+    for entry in report.get("tests", []):
+        nodeid: str = entry.get("nodeid", "unknown")
+        # test_id = last segment after "::" — the function name
+        test_id = nodeid.rsplit("::", 1)[-1]
+        name = _human_name(test_id)
+        passed = entry.get("outcome") == "passed"
+
+        # Build evidence: longrepr + optional metadata dict
+        evidence_parts: dict = {}
+        if entry.get("longrepr"):
+            evidence_parts["longrepr"] = entry["longrepr"]
+        if entry.get("metadata"):
+            evidence_parts["metadata"] = entry["metadata"]
+        raw_evidence = json.dumps(evidence_parts) if evidence_parts else ""
+
+        findings.append(
+            AssuranceFinding(
+                test_id=test_id,
+                name=name,
+                passed=passed,
+                # AssuranceFinding sanitizes via _sanitize() and caps at 16 KiB
+                evidence=raw_evidence,
+            )
+        )
+
+    summary = report.get("summary", {})
+    passed_count = summary.get("passed", sum(1 for f in findings if f.passed))
+    failed_count = summary.get("failed", sum(1 for f in findings if not f.passed))
+    errors_count = summary.get("error", 0)
+
+    return AssuranceResult(
+        suite=suite,
+        findings=findings,
+        passed=passed_count,
+        failed=failed_count,
+        errors=errors_count,
+    )
+
 
 class RampartAssurance(AssuranceAdapter):
     """RAMPART assurance adapter.
 
-    Wraps the real RAMPART runner.  Requires `pip install -e ".[integration]"`.
+    Shells out to pytest against the bundled ``rampart_suite`` package, which
+    contains pytest functions decorated with ``@pytest.mark.harm``.  The agent
+    endpoint is passed via the ``GAUNTLET_AGENT_ENDPOINT`` environment variable
+    so that fixture code inside the suite can reach the sandboxed agent without
+    this adapter needing to know the suite's internal structure.
 
-    RAMPART (Microsoft, MIT) is pytest-native: tests are standard pytest functions
-    decorated with RAMPART markers.  This adapter drives RAMPART programmatically
-    against the sandboxed agent endpoint.
+    pytest output is captured via ``pytest-json-report``.  The JSON report is
+    parsed into an ``AssuranceResult``; the temp file is always deleted
+    (``finally`` block).
 
-    RAMPART v0.1.0 supports XPIA (cross-prompt injection) attacks only.  The
-    "default" suite runs all registered XPIA tests.
+    Requires: ``pytest-json-report>=1.5`` (part of the ``[integration]`` extra).
 
     Security:
         - No credentials are passed to this adapter or injected into the agent.
-        - Finding evidence is sanitized by AssuranceFinding at construction time.
+        - Finding evidence is sanitised at ``AssuranceFinding`` construction time
+          via ``_sanitize()`` (16 KiB cap, credential/path redaction).
+        - The ``GAUNTLET_AGENT_ENDPOINT`` env var carries only a plain HTTP URL —
+          never a credential, token, or host path.
     """
 
     def run(
@@ -290,53 +369,55 @@ class RampartAssurance(AssuranceAdapter):
         suite: str,
         agent_endpoint: str,
     ) -> AssuranceResult:
-        try:
-            import rampart  # type: ignore[import]
-        except ImportError as exc:
-            raise AssuranceError(
-                "RAMPART is not installed.  "
-                "Install with: pip install -e '.[integration]'"
-            ) from exc
+        """Run the rampart_suite against the agent endpoint and return a result.
+
+        Args:
+            suite:          Suite label stored in AssuranceResult (e.g. "default").
+            agent_endpoint: HTTP address of the sandboxed agent; forwarded to
+                            rampart_suite tests via GAUNTLET_AGENT_ENDPOINT.
+
+        Returns:
+            AssuranceResult with per-test findings and aggregate counts.
+
+        Raises:
+            AssuranceError: If pytest exits with code 5 (no tests collected),
+                            if the JSON report file is missing after the run,
+                            or if the JSON report cannot be parsed.
+        """
+        suite_dir = Path(__file__).parent / "rampart_suite"
+        fd, report_path = tempfile.mkstemp(suffix=".json", prefix="rampart-")
+        os.close(fd)
+
+        env = os.environ.copy()
+        env["GAUNTLET_AGENT_ENDPOINT"] = agent_endpoint
+
+        cmd = [
+            sys.executable, "-m", "pytest", str(suite_dir),
+            "-m", "harm",
+            "--json-report",
+            f"--json-report-file={report_path}",
+            "-q",
+        ]
 
         try:
-            # RAMPART alpha API (v0.1.0):
-            #   rampart.Runner accepts the agent endpoint and a suite name.
-            #   It returns a result object with per-test outcomes.
-            runner = rampart.Runner(
-                agent_endpoint=agent_endpoint,
-                suite=suite,
-            )
-            raw_result = runner.run()
+            proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
 
-            findings: list[AssuranceFinding] = []
-            for test in raw_result.tests:
-                # str(test.evidence) may contain data produced by the untrusted
-                # target agent.  AssuranceFinding sanitizes via _sanitize(), which
-                # also truncates to _MAX_INPUT_LENGTH before applying regexes.
-                findings.append(
-                    AssuranceFinding(
-                        test_id=test.id,
-                        name=test.name,
-                        passed=test.passed,
-                        evidence=str(test.evidence or ""),
-                    )
+            # Exit code 5 means pytest collected zero tests — the suite dir is
+            # absent or no tests matched the marker.  This is always an error.
+            if proc.returncode == 5 or not Path(report_path).exists():
+                raise AssuranceError(
+                    f"rampart suite produced no report (pytest exit {proc.returncode}); "
+                    f"ensure rampart_suite is installed and pytest-json-report>=1.5 is available"
                 )
 
-            passed = sum(1 for f in findings if f.passed)
-            failed = sum(1 for f in findings if not f.passed)
-            errors = getattr(raw_result, "errors", 0)
+            try:
+                report = json.loads(Path(report_path).read_text())
+            except (json.JSONDecodeError, OSError) as exc:
+                raise AssuranceError(
+                    f"rampart suite report could not be parsed: {type(exc).__name__}"
+                ) from exc
 
-            return AssuranceResult(
-                suite=suite,
-                findings=findings,
-                passed=passed,
-                failed=failed,
-                errors=errors,
-            )
-        except AssuranceError:
-            raise
-        except Exception as exc:
-            # Sanitize the exception message before raising — it may contain
-            # data from the target agent that RAMPART surfaced in a runner crash.
-            msg = _sanitize(f"RAMPART runner error: {type(exc).__name__}: {exc}")
-            raise AssuranceError(msg) from exc
+            return _result_from_report(report, suite)
+
+        finally:
+            Path(report_path).unlink(missing_ok=True)
