@@ -38,12 +38,26 @@ class _HttpSession:
     """Thin sync-over-async shim that POSTs a single turn to the agent."""
 
     def __init__(self, endpoint: str) -> None:
-        self._endpoint = endpoint
+        # endpoint is the base URL (e.g. http://localhost:8080); /chat is the
+        # canonical agent route for inference requests.
+        self._chat_url = endpoint.rstrip("/") + "/chat"
 
     async def send_async(self, request: Request) -> Response:  # type: ignore[override]
-        """POST the prompt to the agent and convert the response shape."""
-        payload: dict = {"prompt": request.prompt}
-        resp = _requests.post(self._endpoint, json=payload, timeout=30)
+        """POST the prompt to the agent and convert the response shape.
+
+        The canonical agent accepts::
+
+            POST /chat
+            {"messages": [{"role": "user", "content": "<prompt>"}]}
+
+        and replies with::
+
+            {"response": "<text>", "tool_calls": [{"name": "...", "arguments": {...}}]}
+        """
+        payload: dict = {
+            "messages": [{"role": "user", "content": request.prompt}],
+        }
+        resp = _requests.post(self._chat_url, json=payload, timeout=60)
         resp.raise_for_status()
         data: dict = resp.json()
 
@@ -51,7 +65,10 @@ class _HttpSession:
             ToolCall(name=tc["name"], arguments=tc.get("arguments", {}))
             for tc in data.get("tool_calls", [])
         ]
-        return Response(text=data.get("text", ""), tool_calls=tool_calls)
+        # The canonical agent returns "response"; fall back to "text" for
+        # any RAMPART-compatible agent that uses the alternative field name.
+        text = data.get("response") or data.get("text", "")
+        return Response(text=text, tool_calls=tool_calls)
 
     async def __aenter__(self) -> "_HttpSession":
         return self
@@ -103,7 +120,10 @@ class _HttpAgentAdapter:
 
     @property
     def observability_profile(self) -> ObservabilityLevel:
-        return ObservabilityLevel.TOOL_CALLS
+        # RAMPART 0.1.0 levels: TOOL_AND_SIDE_EFFECTS, TOOL_ONLY, RESPONSE_ONLY.
+        # The canonical agent surfaces tool calls; use TOOL_ONLY so RAMPART's
+        # ToolCalled evaluator can inspect the call trace directly.
+        return ObservabilityLevel.TOOL_ONLY
 
 
 # ---------------------------------------------------------------------------
