@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import os
 import json
+from pathlib import Path
 
 import pytest
 import requests as _requests
+import urllib3
 
 from rampart import (
     AppManifest,
@@ -28,6 +30,24 @@ from rampart import (
     ToolCall,
     ToolDeclaration,
 )
+
+
+# ---------------------------------------------------------------------------
+# OpenShell mTLS — gateway-exposed sandbox services require client certs
+# ---------------------------------------------------------------------------
+#
+# When `gauntlet run --policy ...` (real OpenShell path) sets GAUNTLET_AGENT_ENDPOINT,
+# the URL points at the gateway's TLS proxy. We supply the active gateway's
+# client cert/key automatically via the shared helper; for plain http://
+# endpoints (--no-sandbox path) `requests` ignores `cert=` and the call goes
+# through as plain HTTP.
+from gauntlet._openshell_mtls import discover_openshell_mtls
+
+# Silence the InsecureRequestWarning that urllib3 emits when verify=False —
+# expected and intentional in this code path; the gateway uses self-signed
+# PKI and the URL host doesn't match the cert SAN. See
+# docs/m1.3.6-gateway-setup.md and src/gauntlet/_openshell_mtls.py.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +61,9 @@ class _HttpSession:
         # endpoint is the base URL (e.g. http://localhost:8080); /chat is the
         # canonical agent route for inference requests.
         self._chat_url = endpoint.rstrip("/") + "/chat"
+        # mTLS material is fetched once per session; None when the endpoint
+        # is a plain HTTP URL or no active openshell gateway is configured.
+        self._cert, self._verify = discover_openshell_mtls()
 
     async def send_async(self, request: Request) -> Response:  # type: ignore[override]
         """POST the prompt to the agent and convert the response shape.
@@ -57,7 +80,13 @@ class _HttpSession:
         payload: dict = {
             "messages": [{"role": "user", "content": request.prompt}],
         }
-        resp = _requests.post(self._chat_url, json=payload, timeout=60)
+        resp = _requests.post(
+            self._chat_url,
+            json=payload,
+            timeout=60,
+            cert=self._cert,
+            verify=self._verify,
+        )
         resp.raise_for_status()
         data: dict = resp.json()
 
