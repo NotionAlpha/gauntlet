@@ -6,14 +6,15 @@
 # service. Idempotent — re-running on an already-provisioned VM is a no-op
 # for completed steps.
 #
-# Pinned to NotionAlpha/OpenShell gauntlet-bindings at SHA 31f9122 (8 SDK
-# fixes that let Gauntlet delete its workarounds — see
+# Pinned to NotionAlpha/OpenShell gauntlet-bindings at SHA 79bfb74 (8 SDK
+# fixes + Fix 2: _pb2 stubs now ship in the wheel so downstream consumers
+# no longer need to run `mise run python:proto` before installing — see
 # docs/superpowers/plans/... in the notionalpha monorepo for context).
 
 set -euo pipefail
 
 OPENSHELL_FORK_URL="${OPENSHELL_FORK_URL:-https://github.com/NotionAlpha/OpenShell.git}"
-OPENSHELL_FORK_SHA="${OPENSHELL_FORK_SHA:-31f9122}"
+OPENSHELL_FORK_SHA="${OPENSHELL_FORK_SHA:-79bfb74}"
 FORK_DIR="${HOME}/work/fork"
 MISE_VERSION="${MISE_VERSION:-v2026.5.15}"
 
