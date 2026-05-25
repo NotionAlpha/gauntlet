@@ -180,27 +180,36 @@ class TestFakeSandbox:
 
 import sys
 import types
-from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import pytest
 
-from gauntlet.sandbox import OpenShellSandbox, SandboxError, SandboxPolicy
+from gauntlet.sandbox import (
+    OpenShellSandbox,
+    SandboxError,
+    SandboxPolicy,
+    _AGENT_HTTP_PORT,
+    _AGENT_SERVICE_NAME,
+)
 
 
 @pytest.fixture
 def fake_openshell(monkeypatch):
     """Build a minimally-shaped fake `openshell` module and install it under
     sys.modules['openshell']. Returns (module, captured) where `captured` is a
-    dict recording the args OpenShellSandbox passed to the fake."""
+    dict recording the args OpenShellSandbox passed to the fake.
+
+    The fake module exposes the public surface that gauntlet-bindings added:
+      - openshell.sandbox_pb2 / openshell_pb2 (Fix 1 top-level aliases)
+      - openshell.policy_from_network_allow (Fix 5)
+      - session.expose_http(port) (Fix 3)
+      - session.exec_detached(command) (Fix 4)
+    """
     captured = {}
 
-    # Fake proto modules — needed because OpenShellSandbox imports them lazily
-    # via importlib.import_module("openshell._proto.sandbox_pb2") and
-    # importlib.import_module("openshell._proto.openshell_pb2").
-    # sandbox_pb2: SandboxPolicy, NetworkPolicyRule, NetworkEndpoint,
-    #              FilesystemPolicy, LandlockPolicy
-    # openshell_pb2: SandboxSpec, SandboxTemplate, ExposeServiceRequest
+    # Fake proto modules — exposed as top-level attributes on the fake openshell
+    # module (gauntlet-bindings Fix 1). `from openshell import sandbox_pb2`
+    # resolves to sys.modules['openshell'].sandbox_pb2.
     fake_sandbox_pb2 = types.SimpleNamespace(
         SandboxPolicy=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
         NetworkPolicyRule=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
@@ -211,40 +220,59 @@ def fake_openshell(monkeypatch):
     fake_openshell_pb2 = types.SimpleNamespace(
         SandboxTemplate=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
         SandboxSpec=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
-        ExposeServiceRequest=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
     )
+
+    # Fake policy_from_network_allow (gauntlet-bindings Fix 5) — builds the
+    # same NetworkPolicyRule structure as the real SDK so the existing policy
+    # assertion tests continue to pass unchanged.
+    def _fake_policy_from_network_allow(destinations, *, rule_name="default_egress",
+                                         filesystem=None, landlock=None):
+        from urllib.parse import urlparse
+        endpoints = []
+        for dest in destinations:
+            if dest.startswith("https://") or dest.startswith("http://"):
+                parsed = urlparse(dest)
+                host = parsed.hostname
+                port = parsed.port or (443 if dest.startswith("https://") else 80)
+            elif ":" in dest:
+                host, port_str = dest.rsplit(":", 1)
+                port = int(port_str)
+            else:
+                host, port = dest, 443
+            endpoints.append(fake_sandbox_pb2.NetworkEndpoint(host=host, port=port))
+        network_policies = (
+            {rule_name: fake_sandbox_pb2.NetworkPolicyRule(endpoints=endpoints)}
+            if endpoints else {}
+        )
+        return fake_sandbox_pb2.SandboxPolicy(
+            filesystem=filesystem or fake_sandbox_pb2.FilesystemPolicy(),
+            landlock=landlock or fake_sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
+            network_policies=network_policies,
+        )
+
+    # Fake ExecHandle returned by exec_detached (gauntlet-bindings Fix 4).
+    class _FakeExecHandle:
+        is_alive = False
+        error = None
+        def join(self, timeout=None): pass  # noqa: E704
 
     # Fake Sandbox context manager — records the spec passed in, yields a stub
     # session, captures __exit__.
-    def _stub_run_in_sandbox(command, *, stream_output=False, **_):
-        # Captures Sandbox.exec(...) invocations made by the adapter's
-        # daemon-thread agent launcher. Returns None immediately so the
-        # thread doesn't block in the unit tests.
-        captured.setdefault("exec_calls", []).append(list(command))
-        return None
-
     class _FakeSession:
         def __init__(self, spec):
             captured["spec"] = spec
-            # The real openshell Sandbox exposes both `id` (UUID string) and
-            # `sandbox.name` (short animal-adjective string). ExposeService
-            # routes by the short name (≤28 chars), not the UUID, so the
-            # adapter reads `session.sandbox.name`.
-            self.id = "550e8400-e29b-41d4-a716-446655440000"  # 36-char UUID
+            self.id = "550e8400-e29b-41d4-a716-446655440000"
             self.sandbox = types.SimpleNamespace(name="fake-sandbox-name")
-            self._client = types.SimpleNamespace(
-                _stub=types.SimpleNamespace(
-                    ExposeService=MagicMock(
-                        return_value=types.SimpleNamespace(
-                            url="http://gateway.local:31415/sandbox/http"
-                        )
-                    )
-                )
-            )
-            # Bind the agent-launch stub at instance-attribute level (a
-            # def-method form would trigger overly-aggressive lint/security
-            # hooks pattern-matching on `def exec`).
-            setattr(self, "exec", _stub_run_in_sandbox)
+
+        def expose_http(self, port, *, service_name="http", domain=False):
+            # gauntlet-bindings Fix 3: returns the host-reachable URL directly.
+            captured.setdefault("expose_http_calls", []).append((port, service_name))
+            return "http://gateway.local:31415/sandbox/http"
+
+        def exec_detached(self, command, *, env=None, workdir=None):
+            # gauntlet-bindings Fix 4: non-blocking; returns an ExecHandle.
+            captured.setdefault("exec_detached_calls", []).append(list(command))
+            return _FakeExecHandle()
 
         def __enter__(self):
             return self
@@ -259,20 +287,19 @@ def fake_openshell(monkeypatch):
     fake_mod = types.ModuleType("openshell")
     fake_mod.Sandbox = _fake_sandbox
     fake_mod.SandboxError = type("OpenShellSandboxError", (RuntimeError,), {})
+    fake_mod.sandbox_pb2 = fake_sandbox_pb2
+    fake_mod.openshell_pb2 = fake_openshell_pb2
+    fake_mod.policy_from_network_allow = _fake_policy_from_network_allow
 
-    # Register in sys.modules so importlib.import_module calls resolve correctly.
     monkeypatch.setitem(sys.modules, "openshell", fake_mod)
-    monkeypatch.setitem(sys.modules, "openshell._proto.sandbox_pb2", fake_sandbox_pb2)
-    monkeypatch.setitem(sys.modules, "openshell._proto.openshell_pb2", fake_openshell_pb2)
 
     # Stub the agent-readiness probe so unit tests don't try to hit the
     # fake endpoint over HTTP. The real probe is exercised in the
-    # integration suite against a live gateway. Signature is (endpoint,
-    # errors_list) — the second arg is the shared error-capture buffer
-    # the daemon thread appends to on exec failure.
+    # integration suite against a live gateway. Signature is
+    # (endpoint, agent_handle, session_or_client).
     monkeypatch.setattr(
         "gauntlet.sandbox._wait_for_agent_ready",
-        lambda _endpoint, _errors: None,
+        lambda _endpoint, _handle, _session: None,
     )
     return fake_mod, captured
 
@@ -349,13 +376,14 @@ def test_openshellsandbox_start_sets_landlock_best_effort(fake_openshell):
     assert captured["spec"].policy.landlock.compatibility == "best_effort"
 
 
-def test_openshellsandbox_start_calls_expose_service_for_endpoint(fake_openshell):
+def test_openshellsandbox_start_calls_expose_http_for_endpoint(fake_openshell):
     fake_mod, captured = fake_openshell
     s = OpenShellSandbox()
     with s.start(agent_image="myimg:0.1", policy=SandboxPolicy()) as ctx:
-        # The agent_endpoint MUST come from ExposeService's response, not from
-        # any speculative `sb.agent_endpoint` attribute.
+        # The agent_endpoint MUST come from session.expose_http(port), not
+        # from a private gRPC call or a speculative `sb.agent_endpoint` attribute.
         assert ctx.agent_endpoint == "http://gateway.local:31415/sandbox/http"
+        assert captured.get("expose_http_calls") == [(_AGENT_HTTP_PORT, _AGENT_SERVICE_NAME)]
 
 
 def test_openshellsandbox_start_yields_sandbox_context_with_correct_metadata(fake_openshell):
@@ -392,24 +420,33 @@ def test_openshellsandbox_maps_openshell_sandbox_error_to_gauntlet_sandbox_error
     """If openshell.Sandbox raises its own SandboxError, OpenShellSandbox must
     catch it and re-raise as gauntlet.sandbox.SandboxError (sanitized)."""
     fake_mod = types.ModuleType("openshell")
-    fake_mod.SandboxError = type("OpenShellSandboxError", (RuntimeError,), {})
+    OpenShellSandboxError = type("OpenShellSandboxError", (RuntimeError,), {})
+    fake_mod.SandboxError = OpenShellSandboxError
+
     def _explode(**_):
-        raise fake_mod.SandboxError("gateway unreachable: /Users/x/.openshell")
+        raise OpenShellSandboxError("gateway unreachable: /Users/x/.openshell")
+
     fake_mod.Sandbox = _explode
-    monkeypatch.setitem(sys.modules, "openshell", fake_mod)
-    # Register proto sub-modules so importlib.import_module resolves them.
-    monkeypatch.setitem(sys.modules, "openshell._proto.sandbox_pb2", types.SimpleNamespace(
+
+    # Attach top-level proto aliases so `from openshell import sandbox_pb2`
+    # resolves correctly (gauntlet-bindings Fix 1 re-exports them as attributes).
+    fake_sandbox_pb2 = types.SimpleNamespace(
         SandboxPolicy=lambda **kw: types.SimpleNamespace(**kw),
         NetworkPolicyRule=lambda **kw: types.SimpleNamespace(**kw),
         NetworkEndpoint=lambda **kw: types.SimpleNamespace(**kw),
         FilesystemPolicy=lambda **kw: types.SimpleNamespace(**kw),
         LandlockPolicy=lambda **kw: types.SimpleNamespace(**kw),
-    ))
-    monkeypatch.setitem(sys.modules, "openshell._proto.openshell_pb2", types.SimpleNamespace(
+    )
+    fake_openshell_pb2 = types.SimpleNamespace(
         SandboxTemplate=lambda **kw: types.SimpleNamespace(**kw),
         SandboxSpec=lambda **kw: types.SimpleNamespace(**kw),
-        ExposeServiceRequest=lambda **kw: types.SimpleNamespace(**kw),
-    ))
+    )
+    fake_mod.sandbox_pb2 = fake_sandbox_pb2
+    fake_mod.openshell_pb2 = fake_openshell_pb2
+    fake_mod.policy_from_network_allow = lambda *a, **kw: types.SimpleNamespace(
+        network_policies={}, filesystem=None, landlock=None
+    )
+    monkeypatch.setitem(sys.modules, "openshell", fake_mod)
 
     s = OpenShellSandbox()
     with pytest.raises(SandboxError) as excinfo:

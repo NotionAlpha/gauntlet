@@ -6,13 +6,14 @@
 # service. Idempotent — re-running on an already-provisioned VM is a no-op
 # for completed steps.
 #
-# Pinned to OpenShell SHA recorded by the M1.3.5 spike (currently
-# 686b24d, upstream parity).
+# Pinned to NotionAlpha/OpenShell gauntlet-bindings at SHA 31f9122 (8 SDK
+# fixes that let Gauntlet delete its workarounds — see
+# docs/superpowers/plans/... in the notionalpha monorepo for context).
 
 set -euo pipefail
 
 OPENSHELL_FORK_URL="${OPENSHELL_FORK_URL:-https://github.com/NotionAlpha/OpenShell.git}"
-OPENSHELL_FORK_SHA="${OPENSHELL_FORK_SHA:-686b24d}"
+OPENSHELL_FORK_SHA="${OPENSHELL_FORK_SHA:-31f9122}"
 FORK_DIR="${HOME}/work/fork"
 MISE_VERSION="${MISE_VERSION:-v2026.5.15}"
 

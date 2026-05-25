@@ -3,8 +3,7 @@
 #
 # Runs INSIDE the Lima VM. Sets up a Python venv at ~/work/gauntlet-venv
 # with gauntlet + [dev,integration] extras + the canonical agent's runtime
-# deps + the openshell Python SDK built from our fork (which fixes the
-# upstream Linux wheel packaging bug — see docs/m1.3.6-gateway-setup.md).
+# deps + the openshell Python SDK built from our fork.
 #
 # Assumes:
 #   - The Lima VM is running.
@@ -53,11 +52,13 @@ info "pip install -r agents/canonical/requirements.txt"
 # 4. Replace the broken upstream Linux openshell wheel with our fork's build.
 #    Why: PyPI ships `openshell` 0.0.47 with empty _proto/ on both Linux
 #    platforms (proto stubs missing; SDK ImportErrors). Our fork's protos are
-#    generated from the .proto sources via `mise run python:proto`. See
-#    docs/m1.3.6-gateway-setup.md.
+#    generated from the .proto sources via `mise run python:proto`.
 info "Replace broken PyPI openshell with our fork's build"
 "${VENV}/bin/pip" install -q 'maturin>=1.5,<2.0'
 
+# TODO(openshell Fix 2): remove this regen step when the fork's wheel
+# build includes the generated _pb2.* stubs (currently they are
+# gitignored and produced only at build time).
 # Generate proto stubs IN the fork's source tree.
 cd "${FORK_DIR}"
 if [ ! -f "python/openshell/_proto/sandbox_pb2.py" ]; then
