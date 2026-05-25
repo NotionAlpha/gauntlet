@@ -187,7 +187,7 @@ def run(
             )
             raise typer.Exit(code=1)
         sandbox_policy = _load_policy_or_exit(policy)
-        sandbox = OpenShellSandbox(policy_path=policy or "policy.yaml")  # type: ignore[assignment]
+        sandbox = OpenShellSandbox(policy_path=policy)  # type: ignore[assignment]
         assurance = RampartAssurance()  # type: ignore[assignment]
 
     try:

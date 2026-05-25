@@ -323,9 +323,7 @@ class TestPolicyLoaderRouting:
         pf = tmp_path / "p.yaml"
         pf.write_text('fs_read_only: ["/usr"]\n')
 
-        fake_oss = MagicMock()
-        with patch.dict("sys.modules", {"openshell": fake_oss}), \
-             patch("gauntlet.cli.run_seam") as run_seam_mock, \
+        with patch("gauntlet.cli.run_seam") as run_seam_mock, \
              patch("gauntlet.cli.render_report", return_value="ok"), \
              patch("gauntlet.cli.RampartAssurance"):
             run_seam_mock.return_value = MagicMock(overall_passed=True)
@@ -360,14 +358,13 @@ class TestPolicyLoaderRouting:
             assert result.exit_code == 0, result.output
 
     def test_run_with_invalid_policy_yaml_exits_with_clear_error(self, tmp_path: Path):
+        """Invalid YAML in --policy file causes exit 1 with a clear 'policy' error."""
         pf = tmp_path / "bad.yaml"
         pf.write_text("network_allow: [unterminated\n")
 
-        fake_oss = MagicMock()
-        with patch.dict("sys.modules", {"openshell": fake_oss}):
-            result = runner.invoke(
-                app,
-                ["run", "--agent-image", "myimg:0.1", "--policy", str(pf)],
-            )
-            assert result.exit_code == 1
-            assert "policy" in result.output.lower()
+        result = runner.invoke(
+            app,
+            ["run", "--agent-image", "myimg:0.1", "--policy", str(pf)],
+        )
+        assert result.exit_code == 1
+        assert "policy" in result.output.lower()
