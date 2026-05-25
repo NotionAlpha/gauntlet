@@ -219,8 +219,12 @@ def fake_openshell(monkeypatch):
     class _FakeSession:
         def __init__(self, spec):
             captured["spec"] = spec
-            self.id = "fake-sandbox-id"
-            # Stub stub_:
+            # The real openshell Sandbox exposes both `id` (UUID string) and
+            # `sandbox.name` (short animal-adjective string). ExposeService
+            # routes by the short name (≤28 chars), not the UUID, so the
+            # adapter reads `session.sandbox.name`.
+            self.id = "550e8400-e29b-41d4-a716-446655440000"  # 36-char UUID
+            self.sandbox = types.SimpleNamespace(name="fake-sandbox-name")
             self._client = types.SimpleNamespace(
                 _stub=types.SimpleNamespace(
                     ExposeService=MagicMock(
@@ -337,9 +341,13 @@ def test_openshellsandbox_start_yields_sandbox_context_with_correct_metadata(fak
     s = OpenShellSandbox()
     policy = SandboxPolicy(network_allow=["https://x.example:443"])
     with s.start(agent_image="myimg:0.1", policy=policy) as ctx:
-        assert ctx.sandbox_id == "fake-sandbox-id"
+        # sandbox_id is the short name (animal-adjective), not the UUID —
+        # the adapter records what's used for routing.
+        assert ctx.sandbox_id == "fake-sandbox-name"
         assert ctx.isolated is True
         assert ctx.policy is policy
+
+
 
 
 def test_openshellsandbox_start_tears_down_on_exit(fake_openshell):

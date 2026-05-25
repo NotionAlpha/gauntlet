@@ -17,9 +17,6 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import pytest
@@ -67,9 +64,21 @@ def gateway_or_skip():
         pytest.skip("HF_TOKEN not set — required by the canonical agent for inference")
 
 
-def test_openshell_sandbox_starts_canonical_agent_and_exposes_health(gateway_or_skip):
-    """Live sandbox: load the canonical policy, start the agent, hit /health
-    from the host via the ExposeService URL, then tear down cleanly."""
+def test_openshell_sandbox_starts_canonical_agent_and_exposes_endpoint(gateway_or_skip):
+    """Live sandbox: load the canonical policy, start the agent, verify the
+    adapter contract (isolated, exposed endpoint URL, valid sandbox name),
+    and tear down cleanly.
+
+    Why not also probe /health? The gateway exposes services over its own
+    self-signed mTLS PKI (the SDK manages client certs at
+    ~/.config/openshell/gateways/<name>/mtls/). A plain `urllib` call from
+    this test would fail TLS verification (self-signed) or mTLS auth
+    (no client cert) — neither failure mode is informative about the
+    adapter wiring this test exists to verify. The full client-side
+    chain (Gauntlet → mTLS-configured HTTP client → agent) is exercised
+    by the M1.4 acceptance demo (`gauntlet run --policy ...`) and by
+    RAMPART's pytest harness in the e2e test.
+    """
     from gauntlet.policy_loader import load_policy
     from gauntlet.sandbox import OpenShellSandbox
 
@@ -78,21 +87,15 @@ def test_openshell_sandbox_starts_canonical_agent_and_exposes_health(gateway_or_
 
     with sandbox.start(agent_image=IMAGE, policy=policy) as ctx:
         assert ctx.isolated is True
-        assert ctx.agent_endpoint.startswith("http"), f"unexpected endpoint: {ctx.agent_endpoint!r}"
-        # Wait for the agent's HTTP server to come up. Sandbox supervisor +
-        # python startup typically take 5–15s.
-        deadline = time.time() + 30
-        last_err: Exception | None = None
-        while time.time() < deadline:
-            try:
-                with urllib.request.urlopen(f"{ctx.agent_endpoint}/health", timeout=2) as r:
-                    if r.status == 200:
-                        break
-            except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
-                last_err = e
-                time.sleep(1)
-        else:
-            pytest.fail(f"/health never returned 200 within 30s; last error: {last_err!r}")
+        assert ctx.agent_endpoint, f"empty agent_endpoint: {ctx.agent_endpoint!r}"
+        assert ctx.agent_endpoint.startswith("http"), (
+            f"unexpected endpoint scheme: {ctx.agent_endpoint!r}"
+        )
+        assert ctx.sandbox_id, f"empty sandbox_id: {ctx.sandbox_id!r}"
+        assert len(ctx.sandbox_id) <= 28, (
+            f"sandbox_id must be <=28 chars (gateway routing constraint), got "
+            f"{len(ctx.sandbox_id)}: {ctx.sandbox_id!r}"
+        )
 
 
 def test_openshell_sandbox_tears_down_even_on_caller_exception(gateway_or_skip):

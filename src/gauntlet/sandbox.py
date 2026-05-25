@@ -358,15 +358,20 @@ class OpenShellSandbox(SandboxAdapter):
                 # if/when openshell ships a public convenience wrapper
                 # (tracked as a future-upstream-contribution candidate in
                 # docs/m1.3.5-openshell-binding-spike.md).
+                # ExposeService routes by the short sandbox NAME (the
+                # animal-adjective string, ≤28 chars), not the UUID `session.id`.
+                # The gateway rejects requests where `sandbox` exceeds 28 chars
+                # with StatusCode.INVALID_ARGUMENT.
+                sandbox_name = session.sandbox.name
                 exposed = session._client._stub.ExposeService(  # noqa: SLF001
                     openshell_pb2.ExposeServiceRequest(
-                        sandbox=session.id,
+                        sandbox=sandbox_name,
                         service=_AGENT_SERVICE_NAME,
                         target_port=_AGENT_HTTP_PORT,
                     )
                 )
                 ctx = SandboxContext(
-                    sandbox_id=str(session.id),
+                    sandbox_id=sandbox_name,
                     agent_endpoint=exposed.url,
                     policy=policy,
                     isolated=True,

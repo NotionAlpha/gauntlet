@@ -67,5 +67,25 @@ else
   mise run package:deb:install
 fi
 
+# 6. Configure the gateway to bind on 0.0.0.0:17670 instead of 127.0.0.1:17670.
+#    Sandbox containers run in their own Docker netns and reach the host via
+#    the docker0 bridge (host.openshell.internal:host-gateway, populated by
+#    OpenShell's docker driver). With the default 127.0.0.1 bind the
+#    container can't reach the gateway for policy fetch and the sandbox
+#    enters SANDBOX_PHASE_ERROR. The override below is a one-line env file
+#    that the gateway service reads at start.
+info "Configuring gateway bind-address for sandbox connectivity"
+mkdir -p ~/.config/openshell
+cat > ~/.config/openshell/gateway.env <<'EOF'
+# Required so sandbox containers can reach the gateway from their own
+# Docker netns. The gateway's default 127.0.0.1 bind is only reachable
+# from the host loopback; sandbox containers use the docker0 bridge IP
+# (via the host.openshell.internal:host-gateway alias the OpenShell
+# docker driver adds to every sandbox container).
+OPENSHELL_BIND_ADDRESS=0.0.0.0
+EOF
+systemctl --user restart openshell-gateway
+sleep 2
+
 info "OpenShell installed. Verifying:"
 openshell status | head -5
