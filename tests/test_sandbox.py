@@ -195,15 +195,20 @@ def fake_openshell(monkeypatch):
     dict recording the args OpenShellSandbox passed to the fake."""
     captured = {}
 
-    # Fake proto module — needed because OpenShellSandbox builds SandboxPolicy
-    # / SandboxSpec / NetworkPolicyRule / NetworkEndpoint / FilesystemPolicy
-    # / LandlockPolicy / SandboxTemplate / ExposeServiceRequest off it.
-    sandbox_pb2 = types.SimpleNamespace(
+    # Fake proto modules — needed because OpenShellSandbox imports them lazily
+    # via importlib.import_module("openshell._proto.sandbox_pb2") and
+    # importlib.import_module("openshell._proto.openshell_pb2").
+    # sandbox_pb2: SandboxPolicy, NetworkPolicyRule, NetworkEndpoint,
+    #              FilesystemPolicy, LandlockPolicy
+    # openshell_pb2: SandboxSpec, SandboxTemplate, ExposeServiceRequest
+    fake_sandbox_pb2 = types.SimpleNamespace(
         SandboxPolicy=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
         NetworkPolicyRule=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
         NetworkEndpoint=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
         FilesystemPolicy=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
         LandlockPolicy=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
+    )
+    fake_openshell_pb2 = types.SimpleNamespace(
         SandboxTemplate=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
         SandboxSpec=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
         ExposeServiceRequest=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
@@ -239,10 +244,11 @@ def fake_openshell(monkeypatch):
     fake_mod = types.ModuleType("openshell")
     fake_mod.Sandbox = _fake_sandbox
     fake_mod.SandboxError = type("OpenShellSandboxError", (RuntimeError,), {})
-    # Expose proto via openshell.sandbox_pb2 (matches the real package layout).
-    fake_mod.sandbox_pb2 = sandbox_pb2
 
+    # Register in sys.modules so importlib.import_module calls resolve correctly.
     monkeypatch.setitem(sys.modules, "openshell", fake_mod)
+    monkeypatch.setitem(sys.modules, "openshell._proto.sandbox_pb2", fake_sandbox_pb2)
+    monkeypatch.setitem(sys.modules, "openshell._proto.openshell_pb2", fake_openshell_pb2)
     return fake_mod, captured
 
 
@@ -357,21 +363,24 @@ def test_openshellsandbox_maps_openshell_sandbox_error_to_gauntlet_sandbox_error
     """If openshell.Sandbox raises its own SandboxError, OpenShellSandbox must
     catch it and re-raise as gauntlet.sandbox.SandboxError (sanitized)."""
     fake_mod = types.ModuleType("openshell")
-    fake_mod.sandbox_pb2 = types.SimpleNamespace(
-        SandboxPolicy=lambda **kw: types.SimpleNamespace(**kw),
-        NetworkPolicyRule=lambda **kw: types.SimpleNamespace(**kw),
-        NetworkEndpoint=lambda **kw: types.SimpleNamespace(**kw),
-        FilesystemPolicy=lambda **kw: types.SimpleNamespace(**kw),
-        LandlockPolicy=lambda **kw: types.SimpleNamespace(**kw),
-        SandboxTemplate=lambda **kw: types.SimpleNamespace(**kw),
-        SandboxSpec=lambda **kw: types.SimpleNamespace(**kw),
-        ExposeServiceRequest=lambda **kw: types.SimpleNamespace(**kw),
-    )
     fake_mod.SandboxError = type("OpenShellSandboxError", (RuntimeError,), {})
     def _explode(**_):
         raise fake_mod.SandboxError("gateway unreachable: /Users/x/.openshell")
     fake_mod.Sandbox = _explode
     monkeypatch.setitem(sys.modules, "openshell", fake_mod)
+    # Register proto sub-modules so importlib.import_module resolves them.
+    monkeypatch.setitem(sys.modules, "openshell._proto.sandbox_pb2", types.SimpleNamespace(
+        SandboxPolicy=lambda **kw: types.SimpleNamespace(**kw),
+        NetworkPolicyRule=lambda **kw: types.SimpleNamespace(**kw),
+        NetworkEndpoint=lambda **kw: types.SimpleNamespace(**kw),
+        FilesystemPolicy=lambda **kw: types.SimpleNamespace(**kw),
+        LandlockPolicy=lambda **kw: types.SimpleNamespace(**kw),
+    ))
+    monkeypatch.setitem(sys.modules, "openshell._proto.openshell_pb2", types.SimpleNamespace(
+        SandboxTemplate=lambda **kw: types.SimpleNamespace(**kw),
+        SandboxSpec=lambda **kw: types.SimpleNamespace(**kw),
+        ExposeServiceRequest=lambda **kw: types.SimpleNamespace(**kw),
+    ))
 
     s = OpenShellSandbox()
     with pytest.raises(SandboxError) as excinfo:

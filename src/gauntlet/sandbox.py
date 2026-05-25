@@ -303,31 +303,44 @@ class OpenShellSandbox(SandboxAdapter):
                 "Install with: pip install -e '.[integration]'"
             ) from exc
 
-        pb = openshell.sandbox_pb2
+        # The openshell SDK splits its proto bindings across two sub-modules:
+        #   openshell._proto.sandbox_pb2   — SandboxPolicy, FilesystemPolicy,
+        #                                    LandlockPolicy, NetworkEndpoint,
+        #                                    NetworkPolicyRule
+        #   openshell._proto.openshell_pb2 — SandboxSpec, SandboxTemplate,
+        #                                    ExposeServiceRequest
+        # (openshell.sandbox_pb2 does not exist in the installed wheel.)
+        # We import lazily here (not at module top-level) so that the unit-test
+        # fixture can inject these sub-modules into sys.modules before the first
+        # real import, and so that this file stays importable when openshell is
+        # not installed.
+        import importlib
+        sandbox_pb2 = importlib.import_module("openshell._proto.sandbox_pb2")
+        openshell_pb2 = importlib.import_module("openshell._proto.openshell_pb2")
 
         # ---- Translate Gauntlet's SandboxPolicy → openshell proto policy ----
         # Filesystem and Landlock are direct mappings; network requires building
         # one NetworkPolicyRule per allowed destination.
         endpoints = [
-            pb.NetworkEndpoint(host=host, port=port)
+            sandbox_pb2.NetworkEndpoint(host=host, port=port)
             for host, port in (_split_host_port(d) for d in policy.network_allow)
         ]
         network_policies = (
-            {_DEFAULT_EGRESS_RULE_NAME: pb.NetworkPolicyRule(endpoints=endpoints)}
+            {_DEFAULT_EGRESS_RULE_NAME: sandbox_pb2.NetworkPolicyRule(endpoints=endpoints)}
             if endpoints
             else {}
         )
-        proto_policy = pb.SandboxPolicy(
-            filesystem=pb.FilesystemPolicy(
+        proto_policy = sandbox_pb2.SandboxPolicy(
+            filesystem=sandbox_pb2.FilesystemPolicy(
                 read_only=list(policy.fs_read_only),
                 read_write=list(policy.fs_read_write),
             ),
-            landlock=pb.LandlockPolicy(compatibility="best_effort"),
+            landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
             network_policies=network_policies,
         )
 
-        spec = pb.SandboxSpec(
-            template=pb.SandboxTemplate(image=agent_image),
+        spec = openshell_pb2.SandboxSpec(
+            template=openshell_pb2.SandboxTemplate(image=agent_image),
             policy=proto_policy,
         )
 
@@ -346,7 +359,7 @@ class OpenShellSandbox(SandboxAdapter):
                 # (tracked as a future-upstream-contribution candidate in
                 # docs/m1.3.5-openshell-binding-spike.md).
                 exposed = session._client._stub.ExposeService(  # noqa: SLF001
-                    pb.ExposeServiceRequest(
+                    openshell_pb2.ExposeServiceRequest(
                         sandbox=session.id,
                         service=_AGENT_SERVICE_NAME,
                         target_port=_AGENT_HTTP_PORT,
