@@ -42,4 +42,5 @@ asyncio_mode = "auto"
 markers = [
     "integration: requires RAMPART and OpenShell installed; skips when absent",
     "harm: RAMPART harm category marker (xpia, tool-misuse, etc.)",
+    "byoc: BYOC-compatibility smoke against the canonical-agent Docker image; requires Docker + image present",
 ]
