@@ -51,24 +51,13 @@ info "pip install -r agents/canonical/requirements.txt"
 
 # 4. Replace the broken upstream Linux openshell wheel with our fork's build.
 #    Why: PyPI ships `openshell` 0.0.47 with empty _proto/ on both Linux
-#    platforms (proto stubs missing; SDK ImportErrors). Our fork's protos are
-#    generated from the .proto sources via `mise run python:proto`.
+#    platforms (proto stubs missing; SDK ImportErrors). Our fork's gauntlet-bindings
+#    branch (commit 00318fb+) adds [tool.maturin].include entries so the
+#    generated _pb2 stubs ship in the wheel — no proto-regen step needed.
 info "Replace broken PyPI openshell with our fork's build"
-"${VENV}/bin/pip" install -q 'maturin>=1.5,<2.0'
-
-# TODO(openshell Fix 2): remove this regen step when the fork's wheel
-# build includes the generated _pb2.* stubs (currently they are
-# gitignored and produced only at build time).
-# Generate proto stubs IN the fork's source tree.
-cd "${FORK_DIR}"
-if [ ! -f "python/openshell/_proto/sandbox_pb2.py" ]; then
-  info "mise run python:proto"
-  # python:proto needs the uv-managed venv for grpc_tools — sync first.
-  mise exec -- uv sync --group dev
-  mise run python:proto
-fi
 
 # Install the fork's openshell as editable (uses mise's Rust 1.95.0).
+cd "${FORK_DIR}"
 "${VENV}/bin/pip" uninstall -y -q openshell || true
 info "pip install -e ${FORK_DIR} (uses mise's Rust 1.95.0)"
 mise exec -- "${VENV}/bin/pip" install -q --no-build-isolation -e "${FORK_DIR}"
