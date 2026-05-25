@@ -1,0 +1,106 @@
+# Lima VM template for the Gauntlet OpenShell gateway.
+#
+# Provisions a Linux VM (Ubuntu 24.04 ARM64 by default; x86_64 supported via
+# Lima's image selection) that holds a real OpenShell gateway built from the
+# NotionAlpha/OpenShell fork. Used by `scripts/lima/gateway-up.sh`.
+#
+# Why a Linux VM, not Docker Desktop or a Homebrew launchd service:
+#   - OpenShell's enforcement primitives (Landlock LSM, seccomp-bpf) are
+#     Linux-kernel features. macOS dev with the Homebrew gateway runs them
+#     in `best_effort` mode (degraded). A Lima VM gives us real kernel
+#     enforcement, matching enterprise deployment.
+#   - The host stays clean: no launchd, no Homebrew formula, no openshell
+#     CLI on the Mac. Everything lives inside the VM disk image.
+#
+# Why build from our fork, not install upstream:
+#   - The OSS Lab is positioned as a deep contributor to OpenShell. Running
+#     a binary we built from our fork (currently at upstream parity) is the
+#     consistent identity story.
+#   - The upstream Linux wheel of `openshell` 0.0.47 ships without the proto
+#     stubs — see docs/m1.3.6-gateway-setup.md. Building the Python SDK from
+#     our fork generates the protos correctly.
+#
+# Resource sizing:
+#   4 CPU, 8GB RAM, 40GB disk — enough headroom to run the gateway, build
+#   OpenShell from source via cargo, and start sandbox containers.
+
+minimumLimaVersion: 2.0.0
+
+base:
+  - template:_images/ubuntu-lts
+  - template:_default/mounts
+
+# Docker is OpenShell's compute driver — install it rootful (sandboxes need
+# privileged network namespace operations the rootless path doesn't support).
+containerd:
+  system: false
+  user: false
+
+cpus: 4
+memory: 8GiB
+disk: 40GiB
+
+# Mount the gauntlet repo writable so the Python venv inside the VM can
+# install it editable and pick up host-side edits immediately.
+#
+# Default assumes the gauntlet repo is at ~/code/gauntlet on the host.
+# Symlink your clone there, OR edit this `location` to your actual path.
+# `scripts/lima/gateway-up.sh` will sed-substitute it from $PWD if invoked
+# from the gauntlet repo root.
+mounts:
+  - location: "~"
+  - location: "~/code/gauntlet"
+    writable: true
+
+# Install Docker via the standard get-docker.com script (same path Lima's
+# upstream docker-rootful template uses).
+provision:
+  - mode: system
+    script: |
+      #!/bin/sh
+      sed -i 's/host.lima.internal.*/host.lima.internal host.docker.internal/' /etc/hosts
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      command -v docker >/dev/null 2>&1 && exit 0
+      export DEBIAN_FRONTEND=noninteractive
+      curl -fsSL https://get.docker.com | sh
+  - mode: yq
+    path: /etc/systemd/system/docker.socket.d/override.conf
+    format: ini
+    expression: .Socket.SocketUser="{{.User}}"
+  - mode: yq
+    path: "/etc/docker/daemon.json"
+    expression: |
+      .features.cdi = true |
+      .features.containerd-snapshotter = true
+
+probes:
+  - script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      if ! timeout 30s bash -c "until command -v docker >/dev/null 2>&1; do sleep 3; done"; then
+        echo >&2 "docker is not installed yet"
+        exit 1
+      fi
+      if ! timeout 30s bash -c "until pgrep dockerd; do sleep 3; done"; then
+        echo >&2 "dockerd is not running"
+        exit 1
+      fi
+    hint: See "/var/log/cloud-init-output.log" in the guest.
+
+hostResolver:
+  hosts:
+    host.docker.internal: host.lima.internal
+
+# Expose Docker socket for any host-side tooling that wants it (optional).
+portForwards:
+  - guestSocket: "/var/run/docker.sock"
+    hostSocket: "{{.Dir}}/sock/docker.sock"
+
+message: |
+  Lima VM ready. Next steps:
+    limactl shell {{.Name}} -- bash scripts/lima/install-gauntlet-venv.sh
+  Then:
+    limactl shell {{.Name}} -- ~/work/gauntlet-venv/bin/gauntlet --version
