@@ -233,23 +233,60 @@ class FakeSandbox(SandboxAdapter):
 # Real OpenShell adapter — requires openshell>=0.0.46 (integration extra)
 # ---------------------------------------------------------------------------
 
-class OpenShellSandbox(SandboxAdapter):
-    """OpenShell sandbox adapter.
+# A stable key for the canonical agent's network egress rule. OpenShell's
+# SandboxPolicy.network_policies is a map<string, NetworkPolicyRule>; the key
+# is the rule's name in reports and logs.
+_DEFAULT_EGRESS_RULE_NAME = "agent_egress"
 
-    Wraps the real openshell client.  Requires `pip install -e ".[integration]"`.
+# The agent's HTTP port. Must match the canonical agent's EXPOSE 8080 / PORT=8080.
+_AGENT_HTTP_PORT = 8080
+
+# The OpenShell-side service name we register for the agent's HTTP server.
+# Reported back in ExposeServiceRequest and shown in `openshell sandbox list`.
+_AGENT_SERVICE_NAME = "http"
+
+
+class OpenShellSandbox(SandboxAdapter):
+    """Real OpenShell sandbox adapter.
+
+    Wraps `openshell.Sandbox` (NVIDIA OpenShell Python SDK, Apache-2.0). The
+    SDK is a gRPC client for a running OpenShell gateway cluster; this adapter
+    assumes a gateway is reachable per the user's `~/.config/openshell/active_gateway`
+    or `$OPENSHELL_GATEWAY` env var (the latter overrides the former). In the
+    canonical NotionAlpha/gauntlet dev setup the gateway runs inside a Lima VM
+    at `https://127.0.0.1:17670`, registered by `scripts/lima/gateway-up.sh`;
+    contributors with a non-default endpoint can `export OPENSHELL_GATEWAY=...`
+    inside the VM session without touching adapter code.
+
+    Requires `pip install -e ".[integration]"`.
+
+    Per the M1.3.5 spike (docs/m1.3.5-openshell-binding-spike.md), this adapter
+    implements the three fixups discovered against the speculative shape:
+      1. `openshell.Sandbox(spec=SandboxSpec(template=SandboxTemplate(image=...)))`
+         — image goes inside the template, not as a top-level kwarg.
+      2. `SandboxPolicy.network_allow` → `NetworkPolicyRule` proto map
+         (deny-by-default; only listed destinations egress).
+      3. Post-`wait_ready` `ExposeService` gRPC call to recover the
+         host-reachable `agent_endpoint` (no `sb.agent_endpoint` attribute exists).
 
     Args:
-        policy_path: Path to the OpenShell declarative YAML policy file.
-                     The policy governs filesystem access, network egress,
-                     process behavior, and inference routing.
+        policy_path: Reserved for future use (currently ignored — `start()`
+                     receives a typed `SandboxPolicy` from the caller, loaded
+                     elsewhere by `gauntlet.policy_loader.load_policy`).
 
     Security:
-        The OpenShell sandbox enforces deny-by-default isolation at the kernel
-        level (Landlock LSM + seccomp-bpf).  The agent cannot reach host resources
-        beyond what the policy explicitly permits.
+        Deny-by-default at the network and filesystem layers. SMTP egress
+        (`send_email`-class side effects) is blocked because ports 25/587 are
+        never in the allow-list. Defense-in-depth at the process/syscall layer
+        is not available in OpenShell 0.0.47 (no seccomp, no exec-deny list)
+        — accepted per the spike, which classifies this as a defense-in-depth
+        observation rather than a binding gap.
     """
 
-    def __init__(self, policy_path: str = "policy.yaml") -> None:
+    def __init__(self, policy_path: str | None = None) -> None:
+        # Kept for CLI backward-compatibility — `gauntlet run --policy <path>`
+        # passes this even though the typed SandboxPolicy is what we use at
+        # start() time. A future revision may drop this parameter.
         self._policy_path = policy_path
 
     @contextmanager
@@ -266,39 +303,95 @@ class OpenShellSandbox(SandboxAdapter):
                 "Install with: pip install -e '.[integration]'"
             ) from exc
 
-        # Translate our SandboxPolicy to the openshell policy format.
-        # OpenShell's alpha API (v0.0.46) accepts a policy dict or YAML path;
-        # we pass the structured policy dict so the deny-by-default posture is
-        # enforced regardless of what the on-disk YAML contains.
-        openshell_policy = {
-            "network": {
-                "allow": [{"destination": d} for d in policy.network_allow],
-            },
-            "filesystem": {
-                "read_only": policy.fs_read_only,
-                "read_write": policy.fs_read_write,
-            },
-        }
+        pb = openshell.sandbox_pb2
 
-        sandbox_id = str(uuid.uuid4())
+        # ---- Translate Gauntlet's SandboxPolicy → openshell proto policy ----
+        # Filesystem and Landlock are direct mappings; network requires building
+        # one NetworkPolicyRule per allowed destination.
+        endpoints = [
+            pb.NetworkEndpoint(host=host, port=port)
+            for host, port in (_split_host_port(d) for d in policy.network_allow)
+        ]
+        network_policies = (
+            {_DEFAULT_EGRESS_RULE_NAME: pb.NetworkPolicyRule(endpoints=endpoints)}
+            if endpoints
+            else {}
+        )
+        proto_policy = pb.SandboxPolicy(
+            filesystem=pb.FilesystemPolicy(
+                read_only=list(policy.fs_read_only),
+                read_write=list(policy.fs_read_write),
+            ),
+            landlock=pb.LandlockPolicy(compatibility="best_effort"),
+            network_policies=network_policies,
+        )
+
+        spec = pb.SandboxSpec(
+            template=pb.SandboxTemplate(image=agent_image),
+            policy=proto_policy,
+        )
+
+        # ---- Lifecycle: open the real Sandbox, expose the HTTP port, yield ----
+        # We wrap only exceptions that originate from OpenShell's own layer
+        # (during sandbox creation / ExposeService). Exceptions raised by the
+        # caller inside the `with s.start(...):` body propagate unchanged so
+        # test assertions and application error-handling are not silently swallowed.
+        caller_exc: BaseException | None = None
         try:
-            # OpenShell alpha API: openshell.Sandbox(image, policy)
-            # The sandbox client manages the full lifecycle (start/stop).
-            with openshell.Sandbox(
-                image=agent_image,
-                policy=openshell_policy,
-                sandbox_id=sandbox_id,
-            ) as sb:
-                agent_endpoint = sb.agent_endpoint
+            with openshell.Sandbox(spec=spec) as session:
+                # ExposeService is the spike-confirmed path to recover the
+                # host-reachable URL — there is no `sb.agent_endpoint`.
+                exposed = session._client._stub.ExposeService(  # noqa: SLF001
+                    pb.ExposeServiceRequest(
+                        sandbox=session.id,
+                        service=_AGENT_SERVICE_NAME,
+                        target_port=_AGENT_HTTP_PORT,
+                    )
+                )
                 ctx = SandboxContext(
-                    sandbox_id=sandbox_id,
-                    agent_endpoint=agent_endpoint,
+                    sandbox_id=str(session.id),
+                    agent_endpoint=exposed.url,
                     policy=policy,
                     isolated=True,
                 )
-                yield ctx
-        except SandboxError:
-            raise
-        except Exception as exc:
+                try:
+                    yield ctx
+                except BaseException as exc:  # noqa: BLE001
+                    # Stash caller exception; re-raise after context exit so the
+                    # inner `with openshell.Sandbox` tears down first.
+                    caller_exc = exc
+                    raise
+        except BaseException as exc:  # noqa: BLE001
+            if caller_exc is exc:
+                # Caller-body exception — let it propagate as-is.
+                raise
+            # OpenShell-layer exception — map to typed SandboxError (sanitized).
+            if isinstance(exc, SandboxError):
+                raise
+            if isinstance(exc, openshell.SandboxError):
+                msg = _sanitize(f"OpenShell sandbox error: {exc}")
+                raise SandboxError(msg) from exc
             msg = _sanitize(f"OpenShell sandbox error: {type(exc).__name__}: {exc}")
             raise SandboxError(msg) from exc
+
+
+def _split_host_port(destination: str) -> tuple[str, int]:
+    """Parse a destination like `https://router.huggingface.co:443` into
+    `("router.huggingface.co", 443)`. Tolerates bare `host:port` too.
+
+    OpenShell's NetworkEndpoint takes host + port separately; the destination
+    strings in SandboxPolicy.network_allow are user-friendly URLs.
+    """
+    s = destination
+    for prefix in ("https://", "http://"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    s = s.split("/", 1)[0]  # strip path
+    if ":" in s:
+        host, port_str = s.rsplit(":", 1)
+        return host, int(port_str)
+    # Default to 443 for HTTPS-shaped destinations; 80 otherwise.
+    if destination.startswith("http://"):
+        return s, 80
+    return s, 443

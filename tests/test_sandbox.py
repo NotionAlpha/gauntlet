@@ -166,3 +166,205 @@ class TestFakeSandbox:
         policy = SandboxPolicy(network_allow=["https://api.example.com"])
         with pytest.raises((AttributeError, TypeError)):
             policy.network_allow.append("https://evil.example.com")  # type: ignore[union-attr]
+
+
+# ===========================================================================
+# OpenShellSandbox unit tests (no real openshell daemon required)
+# ===========================================================================
+#
+# We inject a fake `openshell` package into sys.modules so OpenShellSandbox's
+# `import openshell` resolves to our scripted double. This isolates the adapter
+# logic (policy translation, ExposeService call, error mapping) from any real
+# gateway. Integration tests in tests/integration/test_openshell_real.py cover
+# the real path.
+
+import sys
+import types
+from contextlib import contextmanager
+from unittest.mock import MagicMock
+
+import pytest
+
+from gauntlet.sandbox import OpenShellSandbox, SandboxError, SandboxPolicy
+
+
+@pytest.fixture
+def fake_openshell(monkeypatch):
+    """Build a minimally-shaped fake `openshell` module and install it under
+    sys.modules['openshell']. Returns (module, captured) where `captured` is a
+    dict recording the args OpenShellSandbox passed to the fake."""
+    captured = {}
+
+    # Fake proto module — needed because OpenShellSandbox builds SandboxPolicy
+    # / SandboxSpec / NetworkPolicyRule / NetworkEndpoint / FilesystemPolicy
+    # / LandlockPolicy / SandboxTemplate / ExposeServiceRequest off it.
+    sandbox_pb2 = types.SimpleNamespace(
+        SandboxPolicy=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
+        NetworkPolicyRule=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
+        NetworkEndpoint=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
+        FilesystemPolicy=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
+        LandlockPolicy=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
+        SandboxTemplate=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
+        SandboxSpec=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
+        ExposeServiceRequest=MagicMock(side_effect=lambda **kw: types.SimpleNamespace(**kw)),
+    )
+
+    # Fake Sandbox context manager — records the spec passed in, yields a stub
+    # session, captures __exit__.
+    class _FakeSession:
+        def __init__(self, spec):
+            captured["spec"] = spec
+            self.id = "fake-sandbox-id"
+            # Stub stub_:
+            self._client = types.SimpleNamespace(
+                _stub=types.SimpleNamespace(
+                    ExposeService=MagicMock(
+                        return_value=types.SimpleNamespace(
+                            url="http://gateway.local:31415/sandbox/http"
+                        )
+                    )
+                )
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            captured["exited"] = True
+            return False
+
+    def _fake_sandbox(*, spec, **_):
+        return _FakeSession(spec)
+
+    fake_mod = types.ModuleType("openshell")
+    fake_mod.Sandbox = _fake_sandbox
+    fake_mod.SandboxError = type("OpenShellSandboxError", (RuntimeError,), {})
+    # Expose proto via openshell.sandbox_pb2 (matches the real package layout).
+    fake_mod.sandbox_pb2 = sandbox_pb2
+
+    monkeypatch.setitem(sys.modules, "openshell", fake_mod)
+    return fake_mod, captured
+
+
+def test_openshellsandbox_start_passes_image_to_template(fake_openshell):
+    fake_mod, captured = fake_openshell
+    s = OpenShellSandbox()
+    policy = SandboxPolicy(network_allow=["https://router.huggingface.co:443"])
+    with s.start(agent_image="myimg:0.1", policy=policy) as ctx:
+        pass
+    # captured["spec"] is the SandboxSpec(template=..., policy=...) we built.
+    spec = captured["spec"]
+    assert spec.template.image == "myimg:0.1"
+
+
+def test_openshellsandbox_start_translates_network_allow_to_proto_rule(fake_openshell):
+    fake_mod, captured = fake_openshell
+    s = OpenShellSandbox()
+    policy = SandboxPolicy(network_allow=["https://router.huggingface.co:443"])
+    with s.start(agent_image="myimg:0.1", policy=policy):
+        pass
+    pb_policy = captured["spec"].policy
+    # We expect a NetworkPolicyRule keyed by something stable (e.g., "agent_egress")
+    # with an endpoint matching router.huggingface.co:443.
+    assert isinstance(pb_policy.network_policies, dict)
+    assert len(pb_policy.network_policies) == 1
+    rule = next(iter(pb_policy.network_policies.values()))
+    assert rule.endpoints[0].host == "router.huggingface.co"
+    assert rule.endpoints[0].port == 443
+
+
+def test_openshellsandbox_start_translates_fs_paths_to_proto(fake_openshell):
+    fake_mod, captured = fake_openshell
+    s = OpenShellSandbox()
+    policy = SandboxPolicy(
+        fs_read_only=["/usr", "/lib"],
+        fs_read_write=["/tmp/agent"],
+    )
+    with s.start(agent_image="myimg:0.1", policy=policy):
+        pass
+    pb_policy = captured["spec"].policy
+    assert pb_policy.filesystem.read_only == ["/usr", "/lib"]
+    assert pb_policy.filesystem.read_write == ["/tmp/agent"]
+
+
+def test_openshellsandbox_start_sets_landlock_best_effort(fake_openshell):
+    """v0.1.0 always uses best_effort Landlock — no enforcement of a strict
+    Landlock mode means the sandbox starts even on darwin (where the kernel
+    feature is absent)."""
+    fake_mod, captured = fake_openshell
+    s = OpenShellSandbox()
+    with s.start(agent_image="myimg:0.1", policy=SandboxPolicy()):
+        pass
+    assert captured["spec"].policy.landlock.compatibility == "best_effort"
+
+
+def test_openshellsandbox_start_calls_expose_service_for_endpoint(fake_openshell):
+    fake_mod, captured = fake_openshell
+    s = OpenShellSandbox()
+    with s.start(agent_image="myimg:0.1", policy=SandboxPolicy()) as ctx:
+        # The agent_endpoint MUST come from ExposeService's response, not from
+        # any speculative `sb.agent_endpoint` attribute.
+        assert ctx.agent_endpoint == "http://gateway.local:31415/sandbox/http"
+
+
+def test_openshellsandbox_start_yields_sandbox_context_with_correct_metadata(fake_openshell):
+    s = OpenShellSandbox()
+    policy = SandboxPolicy(network_allow=["https://x.example:443"])
+    with s.start(agent_image="myimg:0.1", policy=policy) as ctx:
+        assert ctx.sandbox_id == "fake-sandbox-id"
+        assert ctx.isolated is True
+        assert ctx.policy is policy
+
+
+def test_openshellsandbox_start_tears_down_on_exit(fake_openshell):
+    fake_mod, captured = fake_openshell
+    s = OpenShellSandbox()
+    with s.start(agent_image="myimg:0.1", policy=SandboxPolicy()):
+        pass
+    assert captured.get("exited") is True
+
+
+def test_openshellsandbox_start_tears_down_on_exception(fake_openshell):
+    fake_mod, captured = fake_openshell
+    s = OpenShellSandbox()
+    with pytest.raises(RuntimeError, match="caller-bug"):
+        with s.start(agent_image="myimg:0.1", policy=SandboxPolicy()):
+            raise RuntimeError("caller-bug")
+    assert captured.get("exited") is True
+
+
+def test_openshellsandbox_maps_openshell_sandbox_error_to_gauntlet_sandbox_error(monkeypatch):
+    """If openshell.Sandbox raises its own SandboxError, OpenShellSandbox must
+    catch it and re-raise as gauntlet.sandbox.SandboxError (sanitized)."""
+    fake_mod = types.ModuleType("openshell")
+    fake_mod.sandbox_pb2 = types.SimpleNamespace(
+        SandboxPolicy=lambda **kw: types.SimpleNamespace(**kw),
+        NetworkPolicyRule=lambda **kw: types.SimpleNamespace(**kw),
+        NetworkEndpoint=lambda **kw: types.SimpleNamespace(**kw),
+        FilesystemPolicy=lambda **kw: types.SimpleNamespace(**kw),
+        LandlockPolicy=lambda **kw: types.SimpleNamespace(**kw),
+        SandboxTemplate=lambda **kw: types.SimpleNamespace(**kw),
+        SandboxSpec=lambda **kw: types.SimpleNamespace(**kw),
+        ExposeServiceRequest=lambda **kw: types.SimpleNamespace(**kw),
+    )
+    fake_mod.SandboxError = type("OpenShellSandboxError", (RuntimeError,), {})
+    def _explode(**_):
+        raise fake_mod.SandboxError("gateway unreachable: /Users/x/.openshell")
+    fake_mod.Sandbox = _explode
+    monkeypatch.setitem(sys.modules, "openshell", fake_mod)
+
+    s = OpenShellSandbox()
+    with pytest.raises(SandboxError) as excinfo:
+        with s.start(agent_image="myimg:0.1", policy=SandboxPolicy()):
+            pass  # pragma: no cover
+    # Host path must be sanitized out.
+    assert "/Users/" not in str(excinfo.value)
+
+
+def test_openshellsandbox_raises_if_openshell_not_installed(monkeypatch):
+    monkeypatch.setitem(sys.modules, "openshell", None)  # forces ImportError on `import openshell`
+    s = OpenShellSandbox()
+    with pytest.raises(SandboxError) as excinfo:
+        with s.start(agent_image="myimg:0.1", policy=SandboxPolicy()):
+            pass  # pragma: no cover
+    assert "not installed" in str(excinfo.value).lower()
