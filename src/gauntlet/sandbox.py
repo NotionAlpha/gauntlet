@@ -341,6 +341,10 @@ class OpenShellSandbox(SandboxAdapter):
             with openshell.Sandbox(spec=spec) as session:
                 # ExposeService is the spike-confirmed path to recover the
                 # host-reachable URL — there is no `sb.agent_endpoint`.
+                # TODO(openshell-binding): replace with session.expose_http(port)
+                # if/when openshell ships a public convenience wrapper
+                # (tracked as a future-upstream-contribution candidate in
+                # docs/m1.3.5-openshell-binding-spike.md).
                 exposed = session._client._stub.ExposeService(  # noqa: SLF001
                     pb.ExposeServiceRequest(
                         sandbox=session.id,

@@ -273,6 +273,26 @@ def test_openshellsandbox_start_translates_network_allow_to_proto_rule(fake_open
     assert rule.endpoints[0].port == 443
 
 
+def test_openshellsandbox_start_translates_multiple_network_allows_into_one_rule(fake_openshell):
+    """Multiple entries in network_allow should produce one NetworkPolicyRule
+    bundling all endpoints — not multiple rules. The proto rule is the unit of
+    'this is what the agent may reach'; endpoints inside it are the allow-list."""
+    fake_mod, captured = fake_openshell
+    s = OpenShellSandbox()
+    policy = SandboxPolicy(network_allow=[
+        "https://a.example.com:443",
+        "https://b.example.com:80",
+    ])
+    with s.start(agent_image="myimg:0.1", policy=policy):
+        pass
+    pb_policy = captured["spec"].policy
+    assert len(pb_policy.network_policies) == 1
+    rule = next(iter(pb_policy.network_policies.values()))
+    assert len(rule.endpoints) == 2
+    hosts = {(ep.host, ep.port) for ep in rule.endpoints}
+    assert hosts == {("a.example.com", 443), ("b.example.com", 80)}
+
+
 def test_openshellsandbox_start_translates_fs_paths_to_proto(fake_openshell):
     fake_mod, captured = fake_openshell
     s = OpenShellSandbox()
