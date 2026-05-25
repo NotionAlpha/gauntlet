@@ -33,7 +33,16 @@ class PolicyLoadError(Exception):
 
 
 def _coerce_list(raw: object, key: str) -> tuple[str, ...]:
-    """Coerce a YAML value into a tuple of strings; raise for any other shape."""
+    """Coerce a YAML value into a tuple of strings.
+
+    `None` (absent key or explicit YAML `null`) returns `()` — consistent with
+    the deny-by-default posture: a missing or explicitly-null section means
+    "no entries allowed."
+
+    Raises:
+        PolicyLoadError: if `raw` is anything other than `None` or a list of
+                         strings.
+    """
     if raw is None:
         return ()
     if not isinstance(raw, list):
@@ -61,8 +70,9 @@ def load_policy(path: Path | str) -> SandboxPolicy:
     try:
         text = p.read_text()
     except OSError as exc:
+        detail = exc.strerror or type(exc).__name__
         raise PolicyLoadError(
-            _sanitize(f"policy: cannot read file: {exc.strerror or 'unknown error'}")
+            _sanitize(f"policy: cannot read file ({detail})")
         ) from exc
 
     try:
@@ -80,9 +90,9 @@ def load_policy(path: Path | str) -> SandboxPolicy:
         raise PolicyLoadError(_sanitize("policy: top-level must be a mapping"))
 
     return SandboxPolicy(
-        network_allow=list(_coerce_list(data.get("network_allow"), "network_allow")),
-        fs_read_only=list(_coerce_list(data.get("fs_read_only"), "fs_read_only")),
-        fs_read_write=list(_coerce_list(data.get("fs_read_write"), "fs_read_write")),
+        network_allow=_coerce_list(data.get("network_allow"), "network_allow"),
+        fs_read_only=_coerce_list(data.get("fs_read_only"), "fs_read_only"),
+        fs_read_write=_coerce_list(data.get("fs_read_write"), "fs_read_write"),
     )
 
 

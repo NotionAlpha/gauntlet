@@ -108,3 +108,21 @@ network_allow: ["https://x.example:443"]
     assert isinstance(policy.network_allow, tuple)
     assert isinstance(policy.fs_read_only, tuple)
     assert isinstance(policy.fs_read_write, tuple)
+
+
+def test_load_treats_empty_list_as_empty_tuple(tmp_path: Path) -> None:
+    """A policy with an explicit empty list is valid — produces an empty
+    tuple, NOT a load error. This is a real-world shape: a policy that
+    opens filesystem paths but blocks all network egress."""
+    path = _write_policy(tmp_path, "network_allow: []\n")
+    policy = load_policy(path)
+    assert policy.network_allow == ()
+
+
+def test_load_treats_explicit_null_as_empty_tuple(tmp_path: Path) -> None:
+    """A policy with an explicit `key: null` is treated the same as an absent
+    key — deny-by-default empty tuple. Documents that `null` is not an error
+    so users who YAML-comment out a section don't get a surprise."""
+    path = _write_policy(tmp_path, "network_allow: null\n")
+    policy = load_policy(path)
+    assert policy.network_allow == ()
