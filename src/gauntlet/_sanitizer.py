@@ -29,6 +29,25 @@ _SK_KEY_RE = re.compile(r"sk-[A-Za-z0-9]{20,}")
 _TOKEN_PREFIX_RE = re.compile(r"(?:ghp|ghs|ghr|npm)_[A-Za-z0-9]{10,}")
 _ABS_PATH_RE = re.compile(r"(?:/[\w.\-]+){3,}")  # 3+ components — stricter than 4+
 _LONG_TOKEN_RE = re.compile(r"[A-Za-z0-9+/=]{40,}")
+# Pure-lowercase-hex strings are usually identifiers (Docker container IDs,
+# UUID-without-dashes, git SHAs, etc.) — not credentials. Excluding them
+# from the long-token redaction lets these IDs show through to the report
+# where they're useful for debugging. Real tokens almost always include
+# either mixed case or a base64-special character (`+`, `/`, `=`).
+_PURE_LOWER_HEX_RE = re.compile(r"^[0-9a-f]+$")
+
+
+def _redact_long_token(match: re.Match[str]) -> str:
+    """Replace a long alphanumeric run with [REDACTED_TOKEN], EXCEPT when
+    it's pure lowercase hex (likely a Docker container ID or UUID, not a
+    token). Tradeoff: hex-encoded HMAC digests would slip through, but
+    real-world tokens have mixed case or base64-special characters
+    (`+`/`/`/`=`) — the exemption is narrow and the debuggability win
+    is large."""
+    text = match.group(0)
+    if _PURE_LOWER_HEX_RE.fullmatch(text):
+        return text
+    return "[REDACTED_TOKEN]"
 
 
 def sanitize(raw: str) -> str:
@@ -60,5 +79,5 @@ def sanitize(raw: str) -> str:
     text = _SK_KEY_RE.sub("[REDACTED_SK_KEY]", text)
     text = _TOKEN_PREFIX_RE.sub("[REDACTED_TOKEN]", text)
     text = _ABS_PATH_RE.sub("[REDACTED_PATH]", text)
-    text = _LONG_TOKEN_RE.sub("[REDACTED_TOKEN]", text)
+    text = _LONG_TOKEN_RE.sub(_redact_long_token, text)
     return text
