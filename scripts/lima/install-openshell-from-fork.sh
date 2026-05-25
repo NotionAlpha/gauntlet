@@ -6,15 +6,16 @@
 # service. Idempotent — re-running on an already-provisioned VM is a no-op
 # for completed steps.
 #
-# Pinned to NotionAlpha/OpenShell gauntlet-bindings at SHA 79bfb74 (8 SDK
-# fixes + Fix 2: _pb2 stubs now ship in the wheel so downstream consumers
-# no longer need to run `mise run python:proto` before installing — see
+# Pinned to NotionAlpha/OpenShell tag v0.0.47-gauntlet-2 (8 SDK fixes
+# on the gauntlet-bindings branch — including Fix 2: _pb2 stubs now ship
+# in the wheel so downstream consumers no longer need to run
+# `mise run python:proto` before installing — see
 # docs/superpowers/plans/... in the notionalpha monorepo for context).
 
 set -euo pipefail
 
 OPENSHELL_FORK_URL="${OPENSHELL_FORK_URL:-https://github.com/NotionAlpha/OpenShell.git}"
-OPENSHELL_FORK_SHA="${OPENSHELL_FORK_SHA:-79bfb74}"
+OPENSHELL_FORK_REF="${OPENSHELL_FORK_REF:-v0.0.47-gauntlet-2}"
 FORK_DIR="${HOME}/work/fork"
 MISE_VERSION="${MISE_VERSION:-v2026.5.15}"
 
@@ -43,7 +44,7 @@ if ! command -v mise >/dev/null 2>&1; then
   sudo chmod +x /usr/local/bin/mise
 fi
 
-# 3. Clone (or update) the fork at the pinned SHA.
+# 3. Clone (or update) the fork at the pinned ref.
 mkdir -p "$(dirname "$FORK_DIR")"
 if [ ! -d "$FORK_DIR/.git" ]; then
   info "Cloning fork: $OPENSHELL_FORK_URL"
@@ -51,9 +52,9 @@ if [ ! -d "$FORK_DIR/.git" ]; then
 fi
 
 cd "$FORK_DIR"
-git fetch --quiet origin
-info "Checking out pinned SHA: $OPENSHELL_FORK_SHA"
-git checkout --quiet "$OPENSHELL_FORK_SHA"
+git fetch --quiet --tags origin
+info "Checking out pinned ref: $OPENSHELL_FORK_REF"
+git checkout --quiet "$OPENSHELL_FORK_REF"
 
 # 4. Install Rust toolchain + protoc + sccache (etc.) per the fork's mise.toml.
 info "mise install (Rust 1.95.0 + protoc + sccache, first-time ~5 min)"
