@@ -66,7 +66,18 @@ def _render_text(result: SeamResult) -> str:
         lines.append("  Isolated   : —")
     else:
         ctx = result.sandbox_context
-        isolated_str = "YES — deny-by-default boundary active" if ctx.isolated else "NO (isolation failed)"
+        # isolation_kind distinguishes intentional --no-sandbox bypass from
+        # an actual isolation failure, and from the OpenShell-active case.
+        # SandboxContext instances created before this field was added
+        # default sensibly based on the isolated bool (backward-compat).
+        kind = getattr(ctx, "isolation_kind", None) or (
+            "isolated" if ctx.isolated else "fake"
+        )
+        isolated_str = {
+            "isolated": "YES — deny-by-default boundary active",
+            "bypassed": "NO — --no-sandbox bypass (DirectDockerRunner)",
+            "fake": "NO — fake adapter (unit-test mode)",
+        }.get(kind, "NO (isolation failed)")
         lines.append(f"  Sandbox ID : {ctx.sandbox_id}")
         lines.append(f"  Isolated   : {isolated_str}")
         policy = ctx.policy

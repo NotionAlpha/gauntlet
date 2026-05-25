@@ -267,8 +267,13 @@ def fake_openshell(monkeypatch):
 
     # Stub the agent-readiness probe so unit tests don't try to hit the
     # fake endpoint over HTTP. The real probe is exercised in the
-    # integration suite against a live gateway.
-    monkeypatch.setattr("gauntlet.sandbox._wait_for_agent_ready", lambda _url: None)
+    # integration suite against a live gateway. Signature is (endpoint,
+    # errors_list) — the second arg is the shared error-capture buffer
+    # the daemon thread appends to on exec failure.
+    monkeypatch.setattr(
+        "gauntlet.sandbox._wait_for_agent_ready",
+        lambda _endpoint, _errors: None,
+    )
     return fake_mod, captured
 
 

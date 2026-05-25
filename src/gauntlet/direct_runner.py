@@ -184,6 +184,7 @@ class DirectDockerRunner(SandboxAdapter):
             agent_endpoint=endpoint,
             policy=policy,
             isolated=False,
+            isolation_kind="bypassed",
         )
         try:
             yield ctx

@@ -112,6 +112,13 @@ class SandboxContext:
     Security: agent_endpoint is the sandboxed address — NOT a host address.
     Do not substitute a raw host address; route all assurance traffic through
     this endpoint so it passes through the isolation boundary.
+
+    `isolation_kind` distinguishes the three states the report renderer needs
+    to communicate accurately:
+      - "isolated" — sandbox is active and enforcing policy (OpenShellSandbox).
+      - "bypassed" — `--no-sandbox` mode; isolation is intentionally absent
+                     (DirectDockerRunner). This is NOT a failure.
+      - "fake"     — FakeSandbox in unit tests; no real boundary.
     """
 
     def __init__(
@@ -120,17 +127,24 @@ class SandboxContext:
         agent_endpoint: str,
         policy: SandboxPolicy,
         isolated: bool,
+        isolation_kind: str | None = None,
     ) -> None:
         self.sandbox_id = sandbox_id
         self.agent_endpoint = agent_endpoint
         self.policy = policy
         self.isolated = isolated
+        # Default for callers that haven't been updated to pass an explicit
+        # kind: "isolated" when isolated=True, otherwise "fake" (the only
+        # non-isolated yield path that existed before isolation_kind was
+        # added was FakeSandbox; the new "bypassed" kind is opt-in).
+        self.isolation_kind = isolation_kind or ("isolated" if isolated else "fake")
 
     def to_dict(self) -> dict:
         return {
             "sandbox_id": self.sandbox_id,
             "agent_endpoint": self.agent_endpoint,
             "isolated": self.isolated,
+            "isolation_kind": self.isolation_kind,
             "policy": self.policy.to_dict(),
         }
 
@@ -138,7 +152,8 @@ class SandboxContext:
         return (
             f"SandboxContext(sandbox_id={self.sandbox_id!r}, "
             f"agent_endpoint={self.agent_endpoint!r}, "
-            f"isolated={self.isolated!r})"
+            f"isolated={self.isolated!r}, "
+            f"isolation_kind={self.isolation_kind!r})"
         )
 
 
@@ -226,7 +241,13 @@ class FakeSandbox(SandboxAdapter):
             sandbox_id=f"fake-{uuid.uuid4().hex[:8]}",
             agent_endpoint=self._endpoint,
             policy=policy,
+            # FakeSandbox claims isolated=True (preserved for the unit-test
+            # invariant that a successful FakeSandbox.start yields ctx.isolated
+            # as True), while isolation_kind tells the report renderer this
+            # was actually the fake adapter so the verdict shouldn't be
+            # presented as a real isolation guarantee.
             isolated=True,
+            isolation_kind="fake",
         )
         yield ctx
 
@@ -399,9 +420,14 @@ class OpenShellSandbox(SandboxAdapter):
                 # crossed into the sandbox — everything else is denied by the
                 # SandboxPolicy's isolation contract.
                 agent_env = _agent_runtime_env()
+                # Shared list captures any exception the daemon thread raises
+                # so the /health timeout message can include it. The thread
+                # appends; the main thread reads — both single-writer in
+                # practice, so no lock needed.
+                agent_errors: list[BaseException] = []
                 _agent_thread = threading.Thread(
                     target=_run_agent_in_sandbox,
-                    args=(session, _AGENT_START_COMMAND, agent_env),
+                    args=(session, _AGENT_START_COMMAND, agent_env, agent_errors),
                     name=f"openshell-agent[{sandbox_name}]",
                     daemon=True,
                 )
@@ -411,13 +437,14 @@ class OpenShellSandbox(SandboxAdapter):
                 # yielding ctx to the caller. Without this, RAMPART (or any
                 # caller) would race the agent's startup and see 502s for
                 # the first 5–10s.
-                _wait_for_agent_ready(exposed.url)
+                _wait_for_agent_ready(exposed.url, agent_errors)
 
                 ctx = SandboxContext(
                     sandbox_id=sandbox_name,
                     agent_endpoint=exposed.url,
                     policy=policy,
                     isolated=True,
+                    isolation_kind="isolated",
                 )
                 try:
                     yield ctx
@@ -460,15 +487,18 @@ def _agent_runtime_env() -> dict[str, str]:
 
 
 def _run_agent_in_sandbox(
-    session, command: tuple[str, ...], env: dict[str, str]
+    session,
+    command: tuple[str, ...],
+    env: dict[str, str],
+    errors: list[BaseException],
 ) -> None:
     """Run the agent's start command inside the sandbox via the SDK's
     `Sandbox.exec` method.
 
     Called from a daemon thread; blocks for the lifetime of the sandbox.
-    Exceptions are swallowed — if the agent fails to start, the /health
-    probe in the main thread will time out and surface the issue with a
-    clearer message.
+    Exceptions raised by the SDK call are appended to `errors` so the main
+    thread's /health probe can include them in its timeout message instead
+    of just reporting "no service" with no root-cause hint.
 
     Why a thread? OpenShell's BYOC supervisor replaces the image's
     CMD/ENTRYPOINT, so the agent process is NOT auto-started. The Python
@@ -484,14 +514,19 @@ def _run_agent_in_sandbox(
         # in Node) from flagging this Python SDK call.
         run_in_sandbox = getattr(session, "exec")
         run_in_sandbox(list(command), env=env, stream_output=False)
-    except Exception:  # noqa: BLE001
-        # If the agent exits or fails to start, the caller's /health probe
-        # (or any subsequent HTTP request) will surface the problem.
-        pass
+    except BaseException as exc:  # noqa: BLE001
+        # Capture for the /health probe to surface. We re-catch BaseException
+        # specifically so KeyboardInterrupt etc. don't bypass the capture.
+        errors.append(exc)
 
 
-def _wait_for_agent_ready(endpoint: str) -> None:
+def _wait_for_agent_ready(endpoint: str, errors: list[BaseException]) -> None:
     """Probe the agent's /health URL until it returns 200, with a timeout.
+
+    `errors` is the list shared with `_run_agent_in_sandbox`. If the daemon
+    thread captured any exception while exec'ing the start command, the
+    most recent one is included in the timeout SandboxError message so
+    the user sees the actual root cause instead of just "no service."
 
     Raises:
         SandboxError: if /health doesn't return 200 within
@@ -526,10 +561,20 @@ def _wait_for_agent_ready(endpoint: str) -> None:
         except requests.RequestException as exc:
             last_status = type(exc).__name__
         time.sleep(1)
+
+    # Timed out. If the daemon thread captured an exception, surface its
+    # type and message — the actual root cause is far more useful than
+    # the generic "service unreachable" hint.
+    if errors:
+        latest = errors[-1]
+        agent_cause = f" Agent-launch error: {type(latest).__name__}: {latest}"
+    else:
+        agent_cause = ""
+
     raise SandboxError(
         _sanitize(
             f"agent /health did not return 200 within "
-            f"{_AGENT_READY_TIMEOUT_SECONDS}s (last status: {last_status!r}). "
+            f"{_AGENT_READY_TIMEOUT_SECONDS}s (last status: {last_status!r}).{agent_cause} "
             "The canonical-agent container is running under OpenShell, but "
             "its HTTP server never came up. Common causes: the image "
             "doesn't include `requirements.txt`'s deps; HF_TOKEN is "

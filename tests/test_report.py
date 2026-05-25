@@ -81,6 +81,55 @@ class TestRenderReportText:
         report_lower = report.lower()
         assert "isolat" in report_lower or "sandbox" in report_lower
 
+    def test_report_distinguishes_bypassed_from_failed_isolation(self):
+        """With DirectDockerRunner (--no-sandbox), the report must NOT say
+        "isolation failed" — that misframes intentional bypass as a failure.
+        The renderer should pick a message that reads as "deliberate bypass."
+        Regression guard for the M1.4 cleanup."""
+        from gauntlet.sandbox import SandboxContext
+        ctx = SandboxContext(
+            sandbox_id="docker-deadbeef",
+            agent_endpoint="http://localhost:8080",
+            policy=SandboxPolicy(),
+            isolated=False,
+            isolation_kind="bypassed",
+        )
+        result = SeamResult(
+            agent_image="test-agent:v1",
+            suite="default",
+            dry_run=False,
+            overall_passed=True,
+            sandbox_context=ctx,
+            assurance_result=AssuranceResult(suite="default", findings=[], passed=0, failed=0, errors=0),
+        )
+        report = render_report(result)
+        assert "isolation failed" not in report.lower()
+        # The renderer should communicate the bypass somehow
+        assert "--no-sandbox" in report or "bypass" in report.lower()
+
+    def test_report_distinguishes_fake_from_real_isolation(self):
+        """With FakeSandbox (--use-fakes), the report must clearly mark the
+        run as fake so a reader doesn't mistake it for a real assurance
+        signal."""
+        from gauntlet.sandbox import SandboxContext
+        ctx = SandboxContext(
+            sandbox_id="fake-abc12345",
+            agent_endpoint="http://fake.local:8080",
+            policy=SandboxPolicy(),
+            isolated=True,
+            isolation_kind="fake",
+        )
+        result = SeamResult(
+            agent_image="test-agent:v1",
+            suite="default",
+            dry_run=False,
+            overall_passed=True,
+            sandbox_context=ctx,
+            assurance_result=AssuranceResult(suite="default", findings=[], passed=0, failed=0, errors=0),
+        )
+        report = render_report(result)
+        assert "fake" in report.lower()
+
     def test_report_mentions_finding_counts(self):
         result = _make_seam_result()
         report = render_report(result)

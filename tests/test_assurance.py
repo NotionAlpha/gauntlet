@@ -53,6 +53,29 @@ class TestSanitizeFinding:
         result = _sanitize_finding(raw)
         assert "A" * 40 not in result
 
+    def test_pure_lowercase_hex_id_preserved(self):
+        """A 64-char pure-lowercase-hex string is almost certainly a Docker
+        container ID, UUID-without-dashes, or git SHA — not a credential.
+        Redacting it removes valuable debugging context with no security
+        benefit. Real tokens use mixed case or base64-special characters."""
+        # Realistic shapes: docker container ID (64 hex), UUID (32 hex)
+        docker_id = "6f969efce2f3" + "a" * 52  # 64 chars, pure lowercase hex
+        uuid_nodashes = "550e8400e29b41d4a716446655440000"  # 32 chars
+        for ident in (docker_id, uuid_nodashes):
+            raw = f"Sandbox container: {ident}"
+            result = _sanitize_finding(raw)
+            assert ident in result, (
+                f"pure-hex id {ident[:20]}... should NOT be redacted"
+            )
+
+    def test_long_token_with_uppercase_still_redacted(self):
+        """A mixed-case 40+-char alphanumeric run IS still redacted —
+        the exemption is narrow (pure lowercase hex only)."""
+        raw = "session=" + "Ab1" * 20  # 60 chars, mixed case
+        result = _sanitize_finding(raw)
+        assert "Ab1Ab1Ab1Ab1" not in result
+        assert "[REDACTED" in result
+
     def test_safe_text_preserved(self):
         raw = "Agent refused to exfiltrate data: policy denied"
         result = _sanitize_finding(raw)
