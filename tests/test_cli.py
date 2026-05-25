@@ -18,6 +18,7 @@ No RAMPART or OpenShell required — all execution tests use --use-fakes, --dry-
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -281,3 +282,89 @@ class TestNoSandboxFlag:
             )
 
         assert result.exit_code == 0, result.output
+
+
+class TestPolicyLoaderRouting:
+    """Tests that --policy YAML is loaded via policy_loader and flows to run_seam."""
+
+    def test_run_with_policy_flag_loads_yaml_into_sandbox_policy(self, tmp_path: Path):
+        """`gauntlet run --policy <path>` MUST call gauntlet.policy_loader.load_policy
+        with the given path, and the returned SandboxPolicy MUST flow through to
+        run_seam()."""
+        pf = tmp_path / "p.yaml"
+        pf.write_text(
+            'network_allow: ["https://router.huggingface.co:443"]\n'
+            'fs_read_write: ["/tmp/agent"]\n',
+        )
+
+        # Patch the seam runner so we capture what the CLI hands it, without
+        # exercising the real OpenShell path.
+        with patch("gauntlet.cli.run_seam") as run_seam_mock, \
+             patch("gauntlet.cli.render_report", return_value="ok"):
+            run_seam_mock.return_value = MagicMock(overall_passed=True)
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--agent-image", "myimg:0.1",
+                    "--policy", str(pf),
+                    "--use-fakes",  # so we don't try to import openshell
+                ],
+            )
+            assert result.exit_code == 0, result.output
+            call = run_seam_mock.call_args
+            policy = call.kwargs["policy"]
+            assert "https://router.huggingface.co:443" in policy.network_allow
+            assert "/tmp/agent" in policy.fs_read_write
+
+    def test_run_without_use_fakes_or_no_sandbox_loads_policy_for_real_path(self, tmp_path: Path):
+        """The default (real OpenShell) path MUST also call load_policy. Mock the
+        OpenShellSandbox import so we don't need the integration extra."""
+        pf = tmp_path / "p.yaml"
+        pf.write_text('fs_read_only: ["/usr"]\n')
+
+        with patch("gauntlet.cli.run_seam") as run_seam_mock, \
+             patch("gauntlet.cli.render_report", return_value="ok"), \
+             patch("gauntlet.cli.RampartAssurance"):
+            run_seam_mock.return_value = MagicMock(overall_passed=True)
+            result = runner.invoke(
+                app,
+                ["run", "--agent-image", "myimg:0.1", "--policy", str(pf)],
+            )
+            assert result.exit_code == 0, result.output
+            policy = run_seam_mock.call_args.kwargs["policy"]
+            assert "/usr" in policy.fs_read_only
+
+    def test_run_no_sandbox_path_does_not_load_policy(self, tmp_path: Path):
+        """With --no-sandbox, the policy YAML is irrelevant (DirectDockerRunner
+        doesn't enforce one). Pass `--policy /nonexistent` and assert the run
+        still succeeds because load_policy is NEVER called on that path."""
+        with patch("gauntlet.cli.run_seam") as run_seam_mock, \
+             patch("gauntlet.cli.render_report", return_value="ok"), \
+             patch("gauntlet.cli.DirectDockerRunner"), \
+             patch("gauntlet.cli.RampartAssurance"):
+            run_seam_mock.return_value = MagicMock(overall_passed=True)
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--agent-image", "myimg:0.1",
+                    "--policy", "/nonexistent/policy.yaml",
+                    "--no-sandbox",
+                ],
+            )
+            # If load_policy were called on --no-sandbox, the missing file would
+            # raise PolicyLoadError and the exit code would be 1.
+            assert result.exit_code == 0, result.output
+
+    def test_run_with_invalid_policy_yaml_exits_with_clear_error(self, tmp_path: Path):
+        """Invalid YAML in --policy file causes exit 1 with a clear 'policy' error."""
+        pf = tmp_path / "bad.yaml"
+        pf.write_text("network_allow: [unterminated\n")
+
+        result = runner.invoke(
+            app,
+            ["run", "--agent-image", "myimg:0.1", "--policy", str(pf)],
+        )
+        assert result.exit_code == 1
+        assert "policy" in result.output.lower()

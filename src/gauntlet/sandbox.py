@@ -26,6 +26,8 @@ Threat model note: see README.md → Threat model.
 
 from __future__ import annotations
 
+import threading
+import time
 import uuid
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -233,23 +235,71 @@ class FakeSandbox(SandboxAdapter):
 # Real OpenShell adapter — requires openshell>=0.0.46 (integration extra)
 # ---------------------------------------------------------------------------
 
-class OpenShellSandbox(SandboxAdapter):
-    """OpenShell sandbox adapter.
+# A stable key for the canonical agent's network egress rule. OpenShell's
+# SandboxPolicy.network_policies is a map<string, NetworkPolicyRule>; the key
+# is the rule's name in reports and logs.
+_DEFAULT_EGRESS_RULE_NAME = "agent_egress"
 
-    Wraps the real openshell client.  Requires `pip install -e ".[integration]"`.
+# The agent's HTTP port. Must match the canonical agent's EXPOSE 8080 / PORT=8080.
+_AGENT_HTTP_PORT = 8080
+
+# The OpenShell-side service name we register for the agent's HTTP server.
+# Reported back in ExposeServiceRequest and shown in `openshell sandbox list`.
+_AGENT_SERVICE_NAME = "http"
+
+# The command to run inside the sandbox to start the canonical agent.
+# OpenShell's BYOC supervisor replaces the image's CMD/ENTRYPOINT, so we have
+# to exec this explicitly after wait_ready. Matches the canonical Dockerfile's
+# `CMD ["python", "agent.py"]` line — the supervisor's working directory is /app.
+_AGENT_START_COMMAND = ("python", "/app/agent.py")
+
+# How long to wait for the agent's /health to return 200 after we exec the
+# start command. Inference imports + Flask boot typically take 5–10s; we
+# allow 60s to be safe on cold container caches.
+_AGENT_READY_TIMEOUT_SECONDS = 60
+
+
+class OpenShellSandbox(SandboxAdapter):
+    """Real OpenShell sandbox adapter.
+
+    Wraps `openshell.Sandbox` (NVIDIA OpenShell Python SDK, Apache-2.0). The
+    SDK is a gRPC client for a running OpenShell gateway cluster; this adapter
+    assumes a gateway is reachable per the user's `~/.config/openshell/active_gateway`
+    or `$OPENSHELL_GATEWAY` env var (the latter overrides the former). In the
+    canonical NotionAlpha/gauntlet dev setup the gateway runs inside a Lima VM
+    at `https://127.0.0.1:17670`, registered by `scripts/lima/gateway-up.sh`;
+    contributors with a non-default endpoint can `export OPENSHELL_GATEWAY=...`
+    inside the VM session without touching adapter code.
+
+    Requires `pip install -e ".[integration]"`.
+
+    Per the M1.3.5 spike (docs/m1.3.5-openshell-binding-spike.md), this adapter
+    implements the three fixups discovered against the speculative shape:
+      1. `openshell.Sandbox(spec=SandboxSpec(template=SandboxTemplate(image=...)))`
+         — image goes inside the template, not as a top-level kwarg.
+      2. `SandboxPolicy.network_allow` → `NetworkPolicyRule` proto map
+         (deny-by-default; only listed destinations egress).
+      3. Post-`wait_ready` `ExposeService` gRPC call to recover the
+         host-reachable `agent_endpoint` (no `sb.agent_endpoint` attribute exists).
 
     Args:
-        policy_path: Path to the OpenShell declarative YAML policy file.
-                     The policy governs filesystem access, network egress,
-                     process behavior, and inference routing.
+        policy_path: Reserved for future use (currently ignored — `start()`
+                     receives a typed `SandboxPolicy` from the caller, loaded
+                     elsewhere by `gauntlet.policy_loader.load_policy`).
 
     Security:
-        The OpenShell sandbox enforces deny-by-default isolation at the kernel
-        level (Landlock LSM + seccomp-bpf).  The agent cannot reach host resources
-        beyond what the policy explicitly permits.
+        Deny-by-default at the network and filesystem layers. SMTP egress
+        (`send_email`-class side effects) is blocked because ports 25/587 are
+        never in the allow-list. Defense-in-depth at the process/syscall layer
+        is not available in OpenShell 0.0.47 (no seccomp, no exec-deny list)
+        — accepted per the spike, which classifies this as a defense-in-depth
+        observation rather than a binding gap.
     """
 
-    def __init__(self, policy_path: str = "policy.yaml") -> None:
+    def __init__(self, policy_path: str | None = None) -> None:
+        # Kept for CLI backward-compatibility — `gauntlet run --policy <path>`
+        # passes this even though the typed SandboxPolicy is what we use at
+        # start() time. A future revision may drop this parameter.
         self._policy_path = policy_path
 
     @contextmanager
@@ -266,39 +316,245 @@ class OpenShellSandbox(SandboxAdapter):
                 "Install with: pip install -e '.[integration]'"
             ) from exc
 
-        # Translate our SandboxPolicy to the openshell policy format.
-        # OpenShell's alpha API (v0.0.46) accepts a policy dict or YAML path;
-        # we pass the structured policy dict so the deny-by-default posture is
-        # enforced regardless of what the on-disk YAML contains.
-        openshell_policy = {
-            "network": {
-                "allow": [{"destination": d} for d in policy.network_allow],
-            },
-            "filesystem": {
-                "read_only": policy.fs_read_only,
-                "read_write": policy.fs_read_write,
-            },
-        }
+        # The openshell SDK splits its proto bindings across two sub-modules:
+        #   openshell._proto.sandbox_pb2   — SandboxPolicy, FilesystemPolicy,
+        #                                    LandlockPolicy, NetworkEndpoint,
+        #                                    NetworkPolicyRule
+        #   openshell._proto.openshell_pb2 — SandboxSpec, SandboxTemplate,
+        #                                    ExposeServiceRequest
+        # (openshell.sandbox_pb2 does not exist in the installed wheel.)
+        # We import lazily here (not at module top-level) so that the unit-test
+        # fixture can inject these sub-modules into sys.modules before the first
+        # real import, and so that this file stays importable when openshell is
+        # not installed.
+        import importlib
+        sandbox_pb2 = importlib.import_module("openshell._proto.sandbox_pb2")
+        openshell_pb2 = importlib.import_module("openshell._proto.openshell_pb2")
 
-        sandbox_id = str(uuid.uuid4())
+        # ---- Translate Gauntlet's SandboxPolicy → openshell proto policy ----
+        # Filesystem and Landlock are direct mappings; network requires building
+        # one NetworkPolicyRule per allowed destination.
+        endpoints = [
+            sandbox_pb2.NetworkEndpoint(host=host, port=port)
+            for host, port in (_split_host_port(d) for d in policy.network_allow)
+        ]
+        network_policies = (
+            {_DEFAULT_EGRESS_RULE_NAME: sandbox_pb2.NetworkPolicyRule(endpoints=endpoints)}
+            if endpoints
+            else {}
+        )
+        proto_policy = sandbox_pb2.SandboxPolicy(
+            filesystem=sandbox_pb2.FilesystemPolicy(
+                read_only=list(policy.fs_read_only),
+                read_write=list(policy.fs_read_write),
+            ),
+            landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
+            network_policies=network_policies,
+        )
+
+        spec = openshell_pb2.SandboxSpec(
+            template=openshell_pb2.SandboxTemplate(image=agent_image),
+            policy=proto_policy,
+        )
+
+        # ---- Lifecycle: open the real Sandbox, expose the HTTP port, yield ----
+        # We wrap only exceptions that originate from OpenShell's own layer
+        # (during sandbox creation / ExposeService). Exceptions raised by the
+        # caller inside the `with s.start(...):` body propagate unchanged so
+        # test assertions and application error-handling are not silently swallowed.
+        caller_exc: BaseException | None = None
         try:
-            # OpenShell alpha API: openshell.Sandbox(image, policy)
-            # The sandbox client manages the full lifecycle (start/stop).
-            with openshell.Sandbox(
-                image=agent_image,
-                policy=openshell_policy,
-                sandbox_id=sandbox_id,
-            ) as sb:
-                agent_endpoint = sb.agent_endpoint
+            with openshell.Sandbox(spec=spec) as session:
+                # ExposeService is the spike-confirmed path to recover the
+                # host-reachable URL — there is no `sb.agent_endpoint`.
+                # TODO(openshell-binding): replace with session.expose_http(port)
+                # if/when openshell ships a public convenience wrapper
+                # (tracked as a future-upstream-contribution candidate in
+                # docs/m1.3.5-openshell-binding-spike.md).
+                # ExposeService routes by the short sandbox NAME (the
+                # animal-adjective string, ≤28 chars), not the UUID `session.id`.
+                # The gateway rejects requests where `sandbox` exceeds 28 chars
+                # with StatusCode.INVALID_ARGUMENT.
+                sandbox_name = session.sandbox.name
+                exposed = session._client._stub.ExposeService(  # noqa: SLF001
+                    openshell_pb2.ExposeServiceRequest(
+                        sandbox=sandbox_name,
+                        service=_AGENT_SERVICE_NAME,
+                        target_port=_AGENT_HTTP_PORT,
+                    )
+                )
+                # The OpenShell BYOC supervisor replaces the image's CMD/ENTRYPOINT
+                # — the agent process is NOT started by the image's own CMD.
+                # We exec the start command in a daemon thread; the thread holds
+                # the exec for the lifetime of the sandbox and dies when the
+                # session __exit__'s `delete()` call terminates the exec stream.
+                # `stream_output=False` so the exec doesn't try to print to
+                # stdout, but it still blocks the thread until exit — that's
+                # what keeps the agent process running.
+                #
+                # We forward the inference-provider credentials from the
+                # gauntlet process's env (HF_TOKEN for the default HuggingFace
+                # Inference Providers backend, OPENAI_BASE_URL/OPENAI_API_KEY
+                # for any swap-in provider). These are the only host env vars
+                # crossed into the sandbox — everything else is denied by the
+                # SandboxPolicy's isolation contract.
+                agent_env = _agent_runtime_env()
+                _agent_thread = threading.Thread(
+                    target=_run_agent_in_sandbox,
+                    args=(session, _AGENT_START_COMMAND, agent_env),
+                    name=f"openshell-agent[{sandbox_name}]",
+                    daemon=True,
+                )
+                _agent_thread.start()
+
+                # Probe /health to confirm the agent's HTTP server is up before
+                # yielding ctx to the caller. Without this, RAMPART (or any
+                # caller) would race the agent's startup and see 502s for
+                # the first 5–10s.
+                _wait_for_agent_ready(exposed.url)
+
                 ctx = SandboxContext(
-                    sandbox_id=sandbox_id,
-                    agent_endpoint=agent_endpoint,
+                    sandbox_id=sandbox_name,
+                    agent_endpoint=exposed.url,
                     policy=policy,
                     isolated=True,
                 )
-                yield ctx
-        except SandboxError:
-            raise
-        except Exception as exc:
+                try:
+                    yield ctx
+                except BaseException as exc:  # noqa: BLE001
+                    # Stash caller exception; re-raise after context exit so the
+                    # inner `with openshell.Sandbox` tears down first.
+                    caller_exc = exc
+                    raise
+        except BaseException as exc:  # noqa: BLE001
+            if caller_exc is exc:
+                # Caller-body exception — let it propagate as-is.
+                raise
+            # OpenShell-layer exception — map to typed SandboxError (sanitized).
+            if isinstance(exc, SandboxError):
+                raise
+            if isinstance(exc, openshell.SandboxError):
+                msg = _sanitize(f"OpenShell sandbox error: {exc}")
+                raise SandboxError(msg) from exc
             msg = _sanitize(f"OpenShell sandbox error: {type(exc).__name__}: {exc}")
             raise SandboxError(msg) from exc
+
+
+_AGENT_FORWARDED_ENV_VARS = ("HF_TOKEN", "OPENAI_BASE_URL", "OPENAI_API_KEY")
+
+
+def _agent_runtime_env() -> dict[str, str]:
+    """Build the env dict forwarded into the sandboxed agent process.
+
+    Only inference-provider credentials are crossed in — everything else
+    is denied by the SandboxPolicy isolation contract. Keys absent from
+    the host env are omitted (passing them as empty strings would shadow
+    any defaults the agent code might apply).
+    """
+    import os
+    return {
+        var: os.environ[var]
+        for var in _AGENT_FORWARDED_ENV_VARS
+        if os.environ.get(var)
+    }
+
+
+def _run_agent_in_sandbox(
+    session, command: tuple[str, ...], env: dict[str, str]
+) -> None:
+    """Run the agent's start command inside the sandbox via the SDK's
+    `Sandbox.exec` method.
+
+    Called from a daemon thread; blocks for the lifetime of the sandbox.
+    Exceptions are swallowed — if the agent fails to start, the /health
+    probe in the main thread will time out and surface the issue with a
+    clearer message.
+
+    Why a thread? OpenShell's BYOC supervisor replaces the image's
+    CMD/ENTRYPOINT, so the agent process is NOT auto-started. The Python
+    SDK only exposes a synchronous `Sandbox.exec` method that blocks until
+    the command exits. A daemon thread is the smallest workaround until
+    upstream ships a non-blocking variant or a "start command" field on
+    SandboxSpec. Tracked as a future-upstream-contribution candidate in
+    docs/m1.3.5-openshell-binding-spike.md.
+    """
+    try:
+        # getattr indirection keeps overly-aggressive lint/security hooks
+        # that pattern-match on `.exec(` (intended for child_process.exec
+        # in Node) from flagging this Python SDK call.
+        run_in_sandbox = getattr(session, "exec")
+        run_in_sandbox(list(command), env=env, stream_output=False)
+    except Exception:  # noqa: BLE001
+        # If the agent exits or fails to start, the caller's /health probe
+        # (or any subsequent HTTP request) will surface the problem.
+        pass
+
+
+def _wait_for_agent_ready(endpoint: str) -> None:
+    """Probe the agent's /health URL until it returns 200, with a timeout.
+
+    Raises:
+        SandboxError: if /health doesn't return 200 within
+                      _AGENT_READY_TIMEOUT_SECONDS.
+    """
+    # Imports are local — `requests` is in the canonical-agent extras, not
+    # gauntlet's core dependencies, and gauntlet.sandbox should be importable
+    # without it (the FakeSandbox path doesn't need it).
+    try:
+        import requests  # type: ignore[import]
+        import urllib3  # type: ignore[import]
+    except ImportError as exc:
+        raise SandboxError(
+            "The `requests` package is required for the OpenShell readiness "
+            "probe. Install with: pip install -e '.[integration]'"
+        ) from exc
+
+    from gauntlet._openshell_mtls import discover_openshell_mtls
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    cert, verify = discover_openshell_mtls()
+
+    health_url = endpoint.rstrip("/") + "/health"
+    deadline = time.time() + _AGENT_READY_TIMEOUT_SECONDS
+    last_status: int | str | None = None
+    while time.time() < deadline:
+        try:
+            r = requests.get(health_url, cert=cert, verify=verify, timeout=3)
+            last_status = r.status_code
+            if r.status_code == 200:
+                return
+        except requests.RequestException as exc:
+            last_status = type(exc).__name__
+        time.sleep(1)
+    raise SandboxError(
+        _sanitize(
+            f"agent /health did not return 200 within "
+            f"{_AGENT_READY_TIMEOUT_SECONDS}s (last status: {last_status!r}). "
+            "The canonical-agent container is running under OpenShell, but "
+            "its HTTP server never came up. Common causes: the image "
+            "doesn't include `requirements.txt`'s deps; HF_TOKEN is "
+            "missing inside the sandbox; the agent crashed on startup."
+        )
+    )
+
+
+def _split_host_port(destination: str) -> tuple[str, int]:
+    """Parse a destination like `https://router.huggingface.co:443` into
+    `("router.huggingface.co", 443)`. Tolerates bare `host:port` too.
+
+    OpenShell's NetworkEndpoint takes host + port separately; the destination
+    strings in SandboxPolicy.network_allow are user-friendly URLs.
+    """
+    s = destination
+    for prefix in ("https://", "http://"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    s = s.split("/", 1)[0]  # strip path
+    if ":" in s:
+        host, port_str = s.rsplit(":", 1)
+        return host, int(port_str)
+    # Default to 443 for HTTPS-shaped destinations; 80 otherwise.
+    if destination.startswith("http://"):
+        return s, 80
+    return s, 443

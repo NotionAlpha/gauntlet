@@ -12,12 +12,14 @@ gauntlet run    Run RAMPART assurance against an agent in an OpenShell sandbox.
 from __future__ import annotations
 
 import sys
+from typing import Optional
 
 import typer
 
 from gauntlet import __version__
 from gauntlet.assurance import FakeAssurance, RampartAssurance
 from gauntlet.direct_runner import DirectDockerRunner
+from gauntlet.policy_loader import PolicyLoadError, load_policy
 from gauntlet.report import render_report
 from gauntlet.sandbox import FakeSandbox, SandboxPolicy
 from gauntlet.seam import SeamError, run_seam
@@ -53,6 +55,20 @@ def main(
     """Gauntlet — the RAMPART + OpenShell seam artifact."""
 
 
+def _load_policy_or_exit(policy_path: Optional[str]) -> SandboxPolicy:
+    """Load the YAML policy or exit 1 with a sanitized error message.
+
+    Returns an empty (deny-by-default) SandboxPolicy when policy_path is None.
+    """
+    if policy_path is None:
+        return SandboxPolicy()
+    try:
+        return load_policy(policy_path)
+    except PolicyLoadError as exc:
+        typer.echo(f"ERROR: policy load failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+
 @app.command()
 def run(
     agent_image: str = typer.Option(
@@ -60,8 +76,8 @@ def run(
         "--agent-image",
         help="OCI image reference for the agent to place under test (e.g. my-agent:latest).",
     ),
-    policy: str = typer.Option(
-        "policy.yaml",
+    policy: Optional[str] = typer.Option(
+        None,
         "--policy",
         help="Path to the OpenShell declarative YAML policy governing the sandbox.",
     ),
@@ -138,20 +154,29 @@ def run(
         raise typer.Exit(code=1)
 
     if no_sandbox:
+        # DirectDockerRunner doesn't enforce a policy — skip YAML load entirely
+        # so that --no-sandbox works regardless of whether --policy points at a
+        # real file. The empty SandboxPolicy() is unused downstream.
         sandbox = DirectDockerRunner()
         assurance = RampartAssurance()
         sandbox_policy = SandboxPolicy()
-    elif use_fakes or dry_run:
+    elif dry_run:
+        # Dry-run just prints the plan without executing — skip YAML load so
+        # that `gauntlet run --dry-run` works without a policy file present.
         sandbox = FakeSandbox()
         assurance = FakeAssurance()
         sandbox_policy = SandboxPolicy()
+    elif use_fakes:
+        # Fakes don't enforce the policy, but we DO load the YAML when the user
+        # provides one — surfacing YAML errors gives consistent feedback
+        # regardless of which downstream adapter runs.
+        sandbox = FakeSandbox()
+        assurance = FakeAssurance()
+        sandbox_policy = _load_policy_or_exit(policy)
     else:
-        # Import real adapters — requires [integration] extra.
+        # Real OpenShell path — requires [integration] extra.
         try:
             from gauntlet.sandbox import OpenShellSandbox  # type: ignore[attr-defined]
-            sandbox = OpenShellSandbox(policy_path=policy)  # type: ignore[assignment]
-            assurance = RampartAssurance()  # type: ignore[assignment]
-            sandbox_policy = SandboxPolicy()
         except ImportError:
             typer.echo(
                 "ERROR: RAMPART or OpenShell is not installed.\n"
@@ -161,6 +186,9 @@ def run(
                 err=True,
             )
             raise typer.Exit(code=1)
+        sandbox_policy = _load_policy_or_exit(policy)
+        sandbox = OpenShellSandbox(policy_path=policy)  # type: ignore[assignment]
+        assurance = RampartAssurance()  # type: ignore[assignment]
 
     try:
         result = run_seam(

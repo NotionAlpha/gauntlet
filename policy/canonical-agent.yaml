@@ -1,0 +1,34 @@
+# Canonical Gauntlet v0.1.0 sandbox policy.
+#
+# Source: docs/superpowers/specs/2026-05-23-gauntlet-m1-real-seam-design.md §5
+# Spike:  docs/m1.3.5-openshell-binding-spike.md
+#
+# Posture: deny-by-default. Only the explicitly listed network destination and
+# filesystem paths are reachable from inside the sandbox.
+#
+# - Network: only router.huggingface.co:443 is allowed (the agent's inference
+#   endpoint). SMTP (25, 587) is implicitly denied because it is not listed.
+# - Filesystem: /tmp/agent is writable for the agent's working scratch; system
+#   paths are read-only.
+# - Landlock: best_effort — sufficient on dev Macs where the kernel doesn't
+#   support Landlock; the sandbox falls back to other enforcement layers.
+#
+# This file is consumed by gauntlet.policy_loader.load_policy() which constructs
+# a SandboxPolicy from it. OpenShellSandbox.start() further translates that
+# into the openshell sandbox_pb2.SandboxPolicy proto at runtime.
+
+network_allow:
+  - 'https://router.huggingface.co:443'
+
+fs_read_only:
+  - '/usr'
+  - '/lib'
+  - '/lib64'
+  - '/bin'
+  - '/sbin'
+  - '/etc'
+
+fs_read_write:
+  - '/tmp/agent'
+
+landlock_mode: best_effort
