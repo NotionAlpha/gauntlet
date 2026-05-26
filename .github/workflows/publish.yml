@@ -1,0 +1,82 @@
+name: publish
+
+# Build wheel + sdist on every push to main (so CI catches packaging breakage
+# before a release), and on every tag matching v*. Uploads to PyPI only on
+# tag pushes, via OIDC trusted publishing — no API token stored in the repo.
+#
+# PyPI trusted-publisher configuration:
+#   project name: gauntlet
+#   owner:        NotionAlpha
+#   repository:   gauntlet
+#   workflow:     publish.yml
+#   environment:  pypi (see job below)
+#
+# Configure once at https://pypi.org/manage/account/publishing/
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'pyproject.toml'
+      - 'src/**'
+      - '.github/workflows/publish.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build backend
+        run: python -m pip install --upgrade pip build
+
+      - name: Build wheel + sdist
+        run: python -m build
+
+      - name: Inspect built artifacts
+        run: |
+          ls -la dist/
+          python -m pip install --upgrade pkginfo
+          for f in dist/*; do
+            echo "--- $f ---"
+            python -m pkginfo "$f" | head -40
+          done
+
+      - name: Smoke-install from the freshly built wheel
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/gauntlet-*.whl
+          /tmp/smoke/bin/gauntlet --help | head -3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    # Runs only on tag pushes. The pypi environment gates the OIDC token
+    # exchange — configure it once at Settings -> Environments -> New
+    # environment "pypi" (no required reviewers needed for a solo project,
+    # but the environment scope is what PyPI's trusted publisher matches on).
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/gauntlet/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
