@@ -2,7 +2,7 @@
 
 All notable changes to Gauntlet are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] — 2026-05-25
+## [0.1.0] — 2026-05-26
 
 First public release.
 
