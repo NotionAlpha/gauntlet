@@ -3,7 +3,10 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gauntlet"
+# Dist name on PyPI is namespaced to NotionAlpha to avoid the existing
+# `gauntlet` project. Import name + CLI command stay as `gauntlet` — see
+# README "Quick start" for the user-facing `pip install notionalpha-gauntlet`.
+name = "notionalpha-gauntlet"
 version = "0.1.0"
 description = "The seam artifact: RAMPART assurance executed against an agent running inside OpenShell isolation — one command"
 readme = "README.md"
@@ -50,6 +53,7 @@ Homepage = "https://notionalpha.com"
 Repository = "https://github.com/NotionAlpha/gauntlet"
 Issues = "https://github.com/NotionAlpha/gauntlet/issues"
 Changelog = "https://github.com/NotionAlpha/gauntlet/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/NotionAlpha/gauntlet#readme"
 
 [project.optional-dependencies]
 dev = [
