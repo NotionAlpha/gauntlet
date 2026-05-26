@@ -53,7 +53,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ```bash
 # From PyPI (no real deps required — fakes mode)
-pip install gauntlet
+pip install notionalpha-gauntlet
 gauntlet run --agent-image my-agent:latest --use-fakes
 
 # From source

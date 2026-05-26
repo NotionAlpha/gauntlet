@@ -5,7 +5,7 @@ name: publish
 # tag pushes, via OIDC trusted publishing — no API token stored in the repo.
 #
 # PyPI trusted-publisher configuration:
-#   project name: gauntlet
+#   project name: notionalpha-gauntlet
 #   owner:        NotionAlpha
 #   repository:   gauntlet
 #   workflow:     publish.yml
@@ -51,7 +51,7 @@ jobs:
       - name: Smoke-install from the freshly built wheel
         run: |
           python -m venv /tmp/smoke
-          /tmp/smoke/bin/pip install dist/gauntlet-*.whl
+          /tmp/smoke/bin/pip install dist/notionalpha_gauntlet-*.whl
           /tmp/smoke/bin/gauntlet --help | head -3
 
       - uses: actions/upload-artifact@v4
